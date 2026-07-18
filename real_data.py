@@ -1,6 +1,7 @@
 # 1. real_data.py
 import pandas as pd
 import numpy as np
+import streamlit as st
 
 BLOCK_CENSUS = {
     "Hilsa":          {"population": 197309, "literacy": 66.73, "sex_ratio": 911,  "child_sex_ratio": 898,  "sc_pct": 18.0, "rural_pct": 74.1, "families": 33209},
@@ -108,6 +109,7 @@ BENCHMARKS = {
     },
 }
 
+@st.cache_data
 def get_blocks_df():
     rows = []
     for block, census in BLOCK_CENSUS.items():

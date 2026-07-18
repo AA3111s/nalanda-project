@@ -342,7 +342,7 @@ _GRAIN = ("url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' "
 
 SPLASH_CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital,wght@0,400;1,400&family=Noto+Serif+Devanagari:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital,wght@0,400;1,400&family=Noto+Serif+Devanagari:wght@400;700&family=Plus+Jakarta+Sans:wght@400;500&display=swap');
 
 /* ── Heritage tokens — scoped to .stApp; the dashboard's :root tokens
       are never loaded while this stylesheet exists (gate precedes them) */
@@ -462,11 +462,10 @@ header,footer,#MainMenu,.stDeployButton,
   content:"";position:absolute;left:50%;top:47%;width:min(66vmin,580px);
   height:min(56vmin,470px);transform:translate(-50%,-50%);z-index:-1;
   border-radius:50%;
-  background:rgba(247,237,214,.85);
-  /* static backdrop blur (never animated — the no-live-filters rule bans
-     animated filters); the mask feathers both the fill and the blur edge
-     so the mandala lines soften gradually instead of cutting off. */
-  backdrop-filter:blur(9px);-webkit-backdrop-filter:blur(9px);
+  /* denser parchment fill instead of backdrop-filter: the mandala rotates
+     beneath this halo, so a backdrop blur re-computed every frame for the
+     splash's whole lifetime. The feathered mask alone softens the lines. */
+  background:rgba(247,237,214,.93);
   -webkit-mask:radial-gradient(closest-side,#000 45%,transparent 98%);
   mask:radial-gradient(closest-side,#000 45%,transparent 98%);
 }
@@ -485,7 +484,7 @@ header,footer,#MainMenu,.stDeployButton,
   -webkit-background-clip:text;background-clip:text;
   opacity:0;
   animation:sp-fade-up .9s var(--sp-e) 2.8s forwards,
-            sp-sheen-text 7s linear 4.2s infinite;
+            sp-sheen-text 7s linear 4.2s 2;
 }
 .sp-sub{
   font-family:'Instrument Serif',serif;font-size:clamp(17px,2.6vmin,26px);
@@ -523,7 +522,7 @@ div.stButton>button{
   transition:background .25s ease,transform .2s ease;
   opacity:0;
   animation:sp-fade-up .8s var(--sp-e) 4.1s forwards,
-            sp-cta-glow 3.6s ease-in-out 5.2s infinite;
+            sp-cta-glow 3.6s ease-in-out 5.2s 3;
 }
 div.stButton>button:hover{background:var(--sp-madder);border-color:var(--sp-madder)}
 div.stButton>button:active{transform:scale(.97)}
@@ -533,7 +532,7 @@ div.stButton>button::before{
   content:"";position:absolute;inset:0;pointer-events:none;
   background:linear-gradient(110deg,transparent 30%,rgba(255,255,255,.22) 50%,transparent 70%);
   transform:translateX(-130%);
-  animation:sp-sheen 4.2s ease 5.6s infinite;
+  animation:sp-sheen 4.2s ease 5.6s 3;
 }
 /* dim the painting during the click round-trip */
 body:has(div.stButton>button:active) .splash-stage{opacity:.35;transition:opacity .3s}
