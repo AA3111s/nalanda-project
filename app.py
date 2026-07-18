@@ -312,14 +312,12 @@ def ct(fig, title="", h=None):
 # ══════════════════════════════════════════════════════════════════════
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital,wght@0,400;1,400&family=Noto+Serif+Devanagari:wght@400;500;600;700&family=Noto+Sans+Devanagari:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@200;300;400;500;600;700;800&family=Fira+Code:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital,wght@0,400;1,400&family=Noto+Serif+Devanagari:wght@400;500;600;700&family=Noto+Sans+Devanagari:wght@400;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap');
 
 /* ── Registered properties: enable true numeric interpolation ──
    Fallback contract: every element also declares --kpi-n inline, so if
    @property is unsupported the counter still resolves to the real value. */
 @property --kpi-n   { syntax:'<integer>'; initial-value:0; inherits:false }
-@property --ring-a  { syntax:'<angle>';   initial-value:0deg; inherits:false }
-@property --glow    { syntax:'<number>';  initial-value:0; inherits:false }
 
 :root{
   --ink:#F4E7C8; --ink-2:#EAD7AE; --surf:#F9F0DC; --surf-2:#EFE2C2;
@@ -358,8 +356,10 @@ footer{visibility:hidden}header{visibility:hidden}.stDeployButton{display:none}
 }
 /* Film grain — the splash's parchment tooth, multiplied into the paper */
 [data-testid="stAppViewContainer"]::after{
-  content:"";position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.16;
-  mix-blend-mode:multiply;
+  /* no mix-blend-mode: a full-viewport blend forces the compositor to
+     re-blend the whole page on every repaint; plain low opacity reads
+     the same on parchment */
+  content:"";position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.11;
   background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
 }
 /* Double-line manuscript frame — the splash border, carried in. Fixed,
@@ -412,21 +412,26 @@ h1,h2,h3,h4{color:var(--tx)!important;font-weight:600!important}
 .mast-seal{
   width:46px;height:46px;border-radius:50%;flex-shrink:0;
   display:grid;place-items:center;font-size:21px;
-  background:conic-gradient(from var(--ring-a),var(--violet),var(--cyan),var(--saffron),var(--violet));
+  position:relative;overflow:hidden;
+}
+/* The gradient ring spins via transform (compositor-only). Animating the
+   conic-gradient angle itself (@property --ring-a) repainted every frame. */
+.mast-seal::after{
+  content:"";position:absolute;inset:-50%;z-index:0;
+  background:conic-gradient(var(--violet),var(--cyan),var(--saffron),var(--violet));
   animation:ring-spin 9s linear infinite;
-  position:relative;
 }
 .mast-seal::before{
-  content:"";position:absolute;inset:2px;border-radius:50%;background:var(--surf);
+  content:"";position:absolute;inset:2px;border-radius:50%;background:var(--surf);z-index:1;
 }
-.mast-seal span{position:relative;z-index:1}
+.mast-seal span{position:relative;z-index:2}
 .mast-hi{
   font-family:'Noto Serif Devanagari',serif;font-size:30px;font-weight:600;
   letter-spacing:-.5px;
   background:linear-gradient(92deg,var(--tx) 8%,var(--violet-dim) 52%,var(--violet) 96%);
   -webkit-background-clip:text;background-clip:text;color:transparent;
   background-size:220% 100%;
-  animation:sheen-text 7s var(--e-soft) infinite;
+  animation:sheen-text 7s var(--e-soft) 2;
   /* Devanagari matras (anusvara, ि, े …) sit ABOVE the em box. With
      background-clip:text + color:transparent, anything outside the element's
      background box paints nothing — line-height:1 silently ate the bindu in
@@ -444,7 +449,7 @@ h1,h2,h3,h4{color:var(--tx)!important;font-weight:600!important}
 .mast-live{display:inline-flex;align-items:center;gap:6px;color:var(--green)}
 .mast-live i{
   width:6px;height:6px;border-radius:50%;background:var(--green);
-  box-shadow:0 0 0 0 rgba(79,124,58,.7);animation:beat 2s var(--e-soft) infinite;
+  box-shadow:0 0 0 0 rgba(79,124,58,.7);animation:beat 2s var(--e-soft) 3;
 }
 
 /* ══ TRICOLOUR ═══════════════════════════════════════════════════════ */
@@ -459,7 +464,7 @@ h1,h2,h3,h4{color:var(--tx)!important;font-weight:600!important}
 .tricolor-strip::after{
   content:"";position:absolute;inset:0;width:34%;
   background:linear-gradient(90deg,transparent,rgba(255,255,255,.55),transparent);
-  animation:sheen 3.6s var(--e-soft) 900ms infinite;
+  animation:sheen 3.6s var(--e-soft) 900ms 2;
 }
 
 /* ══ HERO ════════════════════════════════════════════════════════════ */
@@ -478,8 +483,9 @@ h1,h2,h3,h4{color:var(--tx)!important;font-weight:600!important}
   width:100%;height:100%;background-size:cover;background-position:center;
   filter:saturate(.6) contrast(1.05) brightness(.66) sepia(.28);
   transform-origin:center;
-  animation:ken 30s var(--e-soft) infinite alternate;
-  will-change:transform;
+  /* one-shot Ken Burns: same drift on arrival, then the large filtered
+     layer goes fully static instead of compositing forever */
+  animation:ken 30s var(--e-soft) 1 forwards;
 }
 /* Duotone wash — unifies four unrelated photographs into one palette */
 .ngis-hero::before{
@@ -502,14 +508,15 @@ h1,h2,h3,h4{color:var(--tx)!important;font-weight:600!important}
   display:inline-flex;align-items:center;gap:9px;margin-bottom:16px;
   padding:6px 13px;border-radius:100px;
   border:1px solid rgba(244,231,200,.28);
-  background:rgba(244,231,200,.09);
-  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  /* translucent ink fill — backdrop-filter here re-blurred the animated
+     hero layer beneath it on every frame */
+  background:rgba(26,16,9,.45);
   font-family:'Fira Code',monospace;font-size:9.5px;letter-spacing:2.4px;
   text-transform:uppercase;color:#EAD7AE;
   animation:fade-up 700ms var(--e-out) 180ms both;
 }
 .hero-kicker i{width:5px;height:5px;border-radius:50%;background:var(--saffron);
-  box-shadow:0 0 10px var(--saffron);animation:beat 2.4s var(--e-soft) infinite}
+  box-shadow:0 0 10px var(--saffron);animation:beat 2.4s var(--e-soft) 3}
 .ngis-hero h1{
   font-family:'Instrument Serif',serif!important;
   font-size:clamp(2.6rem,5vw,4.4rem)!important;font-weight:400!important;
@@ -535,15 +542,6 @@ h1,h2,h3,h4{color:var(--tx)!important;font-weight:600!important}
   height:2px;width:0;margin:16px 0 0;
   background:linear-gradient(90deg,var(--saffron),rgba(233,162,27,.4),transparent);
   animation:rule-grow 1200ms var(--e-out) 520ms both;
-}
-/* Decorative parallax only — if scroll timelines are unsupported this is
-   simply absent; no content depends on it. */
-@supports (animation-timeline: view()){
-  .ngis-hero-bg{
-    animation:ken 30s var(--e-soft) infinite alternate, hero-drift linear both;
-    animation-timeline:auto, view();
-    animation-range:normal, entry 0% exit 100%;
-  }
 }
 
 /* ══ PAPER PRIMITIVE ═════════════════════════════════════════════════
@@ -649,7 +647,6 @@ h1,h2,h3,h4{color:var(--tx)!important;font-weight:600!important}
 .sec-label::before{
   content:"";width:5px;height:5px;border-radius:50%;background:var(--violet);
   box-shadow:0 0 8px rgba(195,83,45,.6);flex-shrink:0;
-  animation:beat 2.6s var(--e-soft) infinite;
 }
 /* the splash's saffron rule, drawn under every section label */
 .sec-label::after{
@@ -732,7 +729,7 @@ h1,h2,h3,h4{color:var(--tx)!important;font-weight:600!important}
 .reg-ticket-header::after{
   content:"";position:absolute;inset:0;width:32%;
   background:linear-gradient(90deg,transparent,rgba(255,255,255,.16),transparent);
-  animation:sheen 4.2s var(--e-soft) 600ms infinite;
+  animation:sheen 4.2s var(--e-soft) 600ms 2;
 }
 .reg-ticket-h1{font-family:'Noto Serif Devanagari',serif!important;font-size:15px!important;
   font-weight:600!important;color:#F7EDD6!important}
@@ -790,7 +787,7 @@ h1,h2,h3,h4{color:var(--tx)!important;font-weight:600!important}
   font-size:10px;font-weight:700;letter-spacing:1.4px;text-transform:uppercase;
 }
 .pri-high{border-color:var(--red)!important;color:var(--red)!important;
-  background:rgba(147,49,43,.1)!important;animation:stamp 2.6s var(--e-soft) infinite}
+  background:rgba(147,49,43,.1)!important;animation:stamp 2.6s var(--e-soft) 3}
 .pri-normal{border-color:var(--green)!important;color:var(--green)!important;
   background:rgba(79,124,58,.1)!important}
 
@@ -877,12 +874,15 @@ section[data-testid="stSidebar"] input,section[data-testid="stSidebar"] textarea
   animation:fade-down 600ms var(--e-out) both}
 .sb-seal{
   width:40px;height:40px;border-radius:50%;flex-shrink:0;display:grid;place-items:center;
-  font-size:19px;position:relative;
-  background:conic-gradient(from var(--ring-a),var(--violet),var(--cyan),var(--saffron),var(--violet));
+  font-size:19px;position:relative;overflow:hidden;
+}
+.sb-seal::after{
+  content:"";position:absolute;inset:-50%;z-index:0;
+  background:conic-gradient(var(--violet),var(--cyan),var(--saffron),var(--violet));
   animation:ring-spin 11s linear infinite;
 }
-.sb-seal::before{content:"";position:absolute;inset:2px;border-radius:50%;background:#F9F0DC}
-.sb-seal span{position:relative;z-index:1}
+.sb-seal::before{content:"";position:absolute;inset:2px;border-radius:50%;background:#F9F0DC;z-index:1}
+.sb-seal span{position:relative;z-index:2}
 .sb-meta{font-family:'Fira Code',monospace;font-size:9.5px;color:var(--tx-mute);
   line-height:2.1;padding-left:4px;letter-spacing:.3px}
 .sb-meta b{color:var(--tx-dim);font-weight:500}
@@ -900,7 +900,7 @@ section[data-testid="stSidebar"] input,section[data-testid="stSidebar"] textarea
 .nav-veil{
   position:fixed;inset:0;z-index:9998;pointer-events:none;
   background:var(--ink);display:grid;place-items:center;
-  animation:nav-veil-out .55s var(--e-soft) .45s forwards;
+  animation:nav-veil-out .25s var(--e-soft) .05s forwards;
 }
 .nav-veil i{
   width:46px;height:46px;border-radius:50%;position:relative;
@@ -1024,7 +1024,6 @@ hr{border-color:var(--hair-2)!important}
 /* ══ KEYFRAMES ═══════════════════════════════════════════════════════ */
 @keyframes ken{from{transform:scale(1.02) translate3d(0,0,0)}
                to{transform:scale(1.16) translate3d(-1.6%,-1.6%,0)}}
-@keyframes hero-drift{from{transform:translateY(-3%)}to{transform:translateY(3%)}}
 @keyframes hero-in{from{opacity:0;transform:translateY(22px) scale(.985)}to{opacity:1;transform:none}}
 @keyframes fade-up{from{opacity:0;transform:translate3d(0,18px,0)}to{opacity:1;transform:none}}
 @keyframes fade-down{from{opacity:0;transform:translate3d(0,-14px,0)}to{opacity:1;transform:none}}
@@ -1038,7 +1037,7 @@ hr{border-color:var(--hair-2)!important}
 @keyframes sheen{0%{transform:translateX(-140%) skewX(-18deg)}
                  100%{transform:translateX(360%) skewX(-18deg)}}
 @keyframes sheen-text{0%,100%{background-position:0% 50%}50%{background-position:100% 50%}}
-@keyframes ring-spin{to{--ring-a:360deg}}
+@keyframes ring-spin{to{transform:rotate(360deg)}}
 @keyframes beat{0%,100%{box-shadow:0 0 0 0 rgba(79,124,58,.55)}70%{box-shadow:0 0 0 7px rgba(79,124,58,0)}}
 @keyframes stamp{0%,100%{box-shadow:0 0 0 0 rgba(147,49,43,.4)}70%{box-shadow:0 0 0 8px rgba(147,49,43,0)}}
 
@@ -1252,6 +1251,25 @@ _prev_page = st.session_state.get("_last_page")
 st.session_state["_last_page"] = selected
 if _prev_page is not None and _prev_page != selected:
     st.markdown('<div class="nav-veil"><i></i></div>', unsafe_allow_html=True)
+
+# ── RERUN GATE — entrance choreography only on page changes ───────────
+# Streamlit rebuilds widget DOM on every rerun, so the time-based entrance
+# animations (fade-up / pop-in / draw-x …) replayed on every filter change,
+# text input, or chart click — each interaction hid content for up to ~1s.
+# On same-page reruns this zeroes those animations (elements land in their
+# final state instantly); a real page change still gets the full sequence.
+# Ambient loops (seal spin, live dot) are deliberately not listed.
+if _prev_page == selected:
+    st.markdown("""<style>
+    .ngis-mast,.ngis-mast::after,.tricolor-strip,.tricolor-strip::after,
+    .ngis-hero,.ngis-hero-bg,.hero-kicker,.ngis-hero h1,.ngis-hero .hero-hi,
+    .ngis-hero p,.hero-rule,.brief-card,.kpi-card,.kpi-card::before,.kpi-value,
+    .sec-label,.sec-label::after,.reg-wrap,.reg-table tbody tr,.reg-ticket,
+    .scheme-entry,.sb-brand,.alert-high,.alert-normal,.alert-warn,
+    .processing-note,.stDataFrame,[data-testid="stPlotlyChart"],
+    [data-testid="stImage"],div[data-testid="metric-container"]
+    {animation-duration:0s!important;animation-delay:0s!important}
+    </style>""", unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════

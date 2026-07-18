@@ -1,4 +1,8 @@
-# Theme only — no behavioural settings.
+[server]
+# Hero images are served from static/ (see image_loader.py) so the browser
+# caches them once instead of re-downloading multi-MB remote originals.
+enableStaticServing = true
+
 #
 # This is load-bearing for the design, not cosmetic duplication of the CSS:
 # Streamlit paints custom-component iframes (e.g. streamlit-option-menu) with
