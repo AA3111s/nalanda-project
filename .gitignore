@@ -10,3 +10,8 @@ skills-lock.json
 .DS_Store
 **/.DS_Store
 logs-*.txt
+
+# Secrets — the Supabase URL embeds the database password. Never commit.
+.streamlit/secrets.toml
+# Local SQLite database + WAL sidecars
+data/

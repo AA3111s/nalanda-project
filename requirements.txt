@@ -4,3 +4,10 @@ pandas==2.2.2
 plotly==5.22.0
 numpy==1.26.4
 statsmodels
+
+# Persistence (db.py). SQLAlchemy speaks both SQLite (local default) and
+# Postgres (Supabase in production) from one code path.
+# NOTE: keep Streamlit Cloud pinned to Python 3.12 — 3.13/3.14 have no
+# prebuilt wheels for the pinned pillow/pandas/numpy and will source-build.
+SQLAlchemy>=2.0,<3
+psycopg2-binary==2.9.9

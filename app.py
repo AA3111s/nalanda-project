@@ -96,6 +96,7 @@ def open_image_safe(raw_bytes: bytes, filename: str = "") -> tuple:
 from real_data import get_blocks_df, HILSA_STATS, BLOCK_CENSUS, JJM_COVERAGE, MGNREGA_DATA
 from classifier import classify_complaint, SCHEMA
 from image_loader import hero_css_bg
+import db
 
 @st.cache_data
 def load_hilsa_boundaries():
@@ -1120,40 +1121,32 @@ def hero(title_en: str, title_hi: str, subtitle: str, image: str, kicker: str):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# SESSION STATE
+# REGISTER — backed by db.py (SQLite locally, Supabase Postgres in prod)
+#
+# The register used to be an in-memory DataFrame in st.session_state, which
+# meant every user saw a private copy and every restart wiped the lot. It is
+# now a real table; session_state holds only transient UI state (the pending
+# OCR result, the API key), never the register itself.
 # ══════════════════════════════════════════════════════════════════════
-if "grievances" not in st.session_state:
-    blocks  = list(BLOCK_CENSUS.keys())
-    cats    = list(SCHEMA.keys())
-    depts   = [SCHEMA[c]["department"].split("(")[0].strip() for c in cats]
-    n       = 90
-    np.random.seed(42)
-    dates   = [(datetime.now()-timedelta(days=int(np.random.randint(0,45)))).strftime("%Y-%m-%d") for _ in range(n)]
-    ci      = np.random.choice(len(cats)-1, n)
-    bi      = np.random.choice(len(blocks), n)
-    pris    = np.random.choice(["High","Medium","Low"], n, p=[0.22,0.48,0.30])
-    stats_  = np.random.choice(["Open","In Progress","Resolved"], n, p=[0.50,0.25,0.25])
-    ages    = np.random.randint(1, 35, n)
-    st.session_state.grievances = pd.DataFrame({
-        "ID":         [f"NLD-{i+1:03d}" for i in range(n)],
-        "Date":       dates,
-        "Category":   [cats[i] for i in ci],
-        "Department": [depts[i] for i in ci],
-        "Block":      [blocks[i] for i in bi],
-        "Priority":   pris.tolist(),
-        "Status":     stats_.tolist(),
-        "Days_Open":  ages.tolist(),
-        "Source":     ["Manual"]*n,
-    })
+db.init_schema()
+db.seed_demo_data()   # 90 synthetic rows, written once, flagged is_demo
 
 for _k in ("ocr_result","classify_result","_gemini_active","gemini_key"):
     if _k not in st.session_state:
         st.session_state[_k] = None if _k != "_gemini_active" else _GEMINI_CHAIN[1]
         if _k == "gemini_key": st.session_state[_k] = ""
 
-df        = st.session_state.grievances
+show_demo = st.session_state.get("include_demo", True)
+df        = db.load_grievances(include_demo=show_demo)
 blocks_df = get_blocks_df()
 resolved  = len(df[df["Status"]=="Resolved"])
+
+
+def flash():
+    """Render and consume a message stashed before an st.rerun()."""
+    msg = st.session_state.pop("_flash", None)
+    if msg:
+        st.success(msg)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1230,7 +1223,18 @@ with st.sidebar:
     gp = st.selectbox("Priority", ["All","High","Medium","Low"], label_visibility="collapsed")
     gb = st.selectbox("Block", ["All"]+sorted(df["Block"].unique().tolist()), label_visibility="collapsed")
 
+    # Demo rows are real table rows flagged is_demo; untick to read true
+    # figures. Changing this re-queries on the next rerun.
+    st.checkbox("प्रदर्शन डेटा शामिल करें · Include demo data",
+                value=st.session_state.get("include_demo", True),
+                key="include_demo")
+
     st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+    _real_n = len(df[~df["is_demo"].astype(bool)]) if "is_demo" in df.columns else 0
+    st.markdown(
+        f"<div class='sb-meta'>DB · <b>{db.backend()}</b><br>"
+        f"वास्तविक प्रकरण · <b>{_real_n}</b></div>",
+        unsafe_allow_html=True)
     now = datetime.now()
     st.markdown(f"<div class='sb-meta'>{now.strftime('%d %b %Y · %H:%M')}<br>जनसंख्या <b>1,97,309</b><br>क्षेत्र <b>140 km²</b><br>ग्राम <b>56</b> · प्रखंड <b>20</b></div>", unsafe_allow_html=True)
 
@@ -1395,6 +1399,81 @@ if selected == "Today's Brief":
         <tbody>{rows_html}</tbody>
       </table>
     </div>""", unsafe_allow_html=True)
+
+    # ── CASE MANAGEMENT ────────────────────────────────────────────────
+    # Every transition is written with its audit row in one transaction
+    # (db.update_status), so a status can never move without a trace of
+    # who moved it, when, and why.
+    st.markdown('<div class="ngis-hr"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="sec-label">प्रकरण प्रबंधन · Case Management</div>',
+                unsafe_allow_html=True)
+    flash()
+
+    _cases = db.case_options(include_demo=show_demo, only_open=True)
+
+    if _cases.empty:
+        st.markdown("<div class='good-block'>✓ No open cases. Every grievance in "
+                    "view has been resolved.</div>", unsafe_allow_html=True)
+    else:
+        _labels = {
+            f'{r.case_no} · {str(r.category).split("/")[0].strip()} · {r.block} [{r.status}]': r.id
+            for r in _cases.itertuples()
+        }
+        cm1, cm2 = st.columns([1.3, 1], gap="large")
+        with cm1:
+            _pick = st.selectbox("Case", list(_labels.keys()),
+                                 label_visibility="collapsed")
+            _gid = _labels[_pick]
+            _cur = _cases.loc[_cases["id"] == _gid, "status"].iloc[0]
+        with cm2:
+            _next = st.selectbox(
+                "New status",
+                [s for s in db.STATUSES if s != _cur],
+                label_visibility="collapsed",
+            )
+
+        _note = st.text_input(
+            "Note", placeholder="टिप्पणी · Note for the register (optional)",
+            label_visibility="collapsed")
+        _by = st.text_input(
+            "Officer", placeholder="अधिकारी · Your name or designation",
+            label_visibility="collapsed")
+
+        if st.button(f"स्थिति बदलें · Move {_pick.split(' ·')[0]} → {_next}",
+                     use_container_width=True):
+            if db.update_status(_gid, _next, note=_note,
+                                changed_by=(_by.strip() or "operator")):
+                st.session_state["_flash"] = f"✅ {_pick.split(' ·')[0]} → {_next}"
+                st.rerun()
+            else:
+                st.markdown("<div class='alert-warn'>No change — the case is "
+                            "already in that status.</div>", unsafe_allow_html=True)
+
+        _hist = db.get_status_history(_gid)
+        if not _hist.empty:
+            _steps = "".join(
+                f'<tr>'
+                f'<td style="padding:7px 12px;font-family:Fira Code,monospace;font-size:10.5px;'
+                f'color:rgba(51,33,15,.58)">{db.to_ist(h.changed_at):%d %b %Y · %H:%M} IST</td>'
+                f'<td style="padding:7px 12px;font-size:11px">'
+                f'{_html.escape(str(h.from_status or "—"))} → '
+                f'<b>{_html.escape(str(h.to_status))}</b></td>'
+                f'<td style="padding:7px 12px;font-size:11px;color:rgba(51,33,15,.78)">'
+                f'{_html.escape(str(h.note or "—"))}</td>'
+                f'<td style="padding:7px 12px;font-size:10.5px;color:rgba(51,33,15,.58)">'
+                f'{_html.escape(str(h.changed_by))}</td>'
+                f'</tr>'
+                for h in _hist.itertuples()
+            )
+            st.markdown(
+                f'<div class="reg-wrap" style="margin-top:14px"><table class="reg-table">'
+                f'<thead><tr>'
+                f'<th><span class="hi">समय</span><span class="en">When</span></th>'
+                f'<th><span class="hi">परिवर्तन</span><span class="en">Transition</span></th>'
+                f'<th><span class="hi">टिप्पणी</span><span class="en">Note</span></th>'
+                f'<th><span class="hi">अधिकारी</span><span class="en">By</span></th>'
+                f'</tr></thead><tbody>{_steps}</tbody></table></div>',
+                unsafe_allow_html=True)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1587,6 +1666,7 @@ elif selected == "Field Capture":
          "pawapuri", "Capture Terminal")
     st.markdown('<div class="ngis-body">', unsafe_allow_html=True)
 
+    flash()
     input_mode=st.radio("Input Mode",["📷  Scan Letter (Image)","✍️  Type / Paste Text"],horizontal=True,label_visibility="collapsed")
     st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
 
@@ -1654,7 +1734,7 @@ elif selected == "Field Capture":
             if st.button("वर्गीकृत करें · Classify & Route →", use_container_width=True):
                 if raw_text.strip():
                     clf=classify_complaint(raw_text)
-                    st.session_state.ocr_result={"transcription":raw_text,"issue_summary":"Manual entry","complainant_name":clf.get("complainant_name","Unknown"),"village":clf.get("village","Unknown"),"block":clf.get("block","Unknown"),"date_filed":clf.get("date_filed","Unknown")}
+                    st.session_state.ocr_result={"transcription":raw_text,"issue_summary":"Manual entry","source":"Manual","complainant_name":clf.get("complainant_name","Unknown"),"village":clf.get("village","Unknown"),"block":clf.get("block","Unknown"),"date_filed":clf.get("date_filed","Unknown")}
                     st.session_state.classify_result=clf
                     st.rerun()
 
@@ -1679,7 +1759,10 @@ elif selected == "Field Capture":
         clf = st.session_state.classify_result
 
         if ocr and clf:
-            new_id   = f"NLD-{len(st.session_state.grievances)+1:03d}"
+            # The case number is assigned by the database inside the insert
+            # transaction, so it cannot be known (or guessed from a row count)
+            # before saving. Show a placeholder until it exists.
+            new_id   = "— on save —"
             reg_date = datetime.now().strftime("%d/%m/%Y")
 
             # ── Safely escape ALL dynamic values before they touch HTML ──
@@ -1806,18 +1889,29 @@ elif selected == "Field Capture":
 
             st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
             if st.button("✅ रजिस्टर में सहेजें · Save to NGIS Register", use_container_width=True):
-                date_val = clf.get("date_filed","Unknown")
-                try: datetime.strptime(date_val,"%Y-%m-%d")
-                except (ValueError,TypeError): date_val = datetime.now().strftime("%Y-%m-%d")
-                new_row=pd.DataFrame([{
-                    "ID":new_id,"Date":date_val,
-                    "Category":clf["category"],"Department":clf["department"],
-                    "Block":clf.get("block","Unknown"),"Priority":clf["priority"],
-                    "Status":"Open","Days_Open":0,"Source":"OCR / Gemini"
-                }])
-                st.session_state.grievances=pd.concat([st.session_state.grievances,new_row],ignore_index=True)
+                # db.insert_grievance owns date parsing, priority
+                # normalisation ("Normal" -> "Medium") and case-number
+                # assignment; the number comes back from the transaction.
+                saved_id = db.insert_grievance({
+                    "date_filed":       clf.get("date_filed"),
+                    "category":         clf["category"],
+                    "department":       clf["department"],
+                    "block":            clf.get("block", "Unknown"),
+                    "priority":         clf["priority"],
+                    "status":           "Open",
+                    "source":           ocr.get("source", "OCR / Gemini"),
+                    "complainant_name": clf.get("complainant_name"),
+                    "village":          clf.get("village"),
+                    "summary":          ocr.get("issue_summary"),
+                    "transcription":    ocr.get("transcription"),
+                    "confidence":       clf.get("confidence"),
+                })
                 st.session_state.ocr_result=None; st.session_state.classify_result=None
-                st.success(f"✅ {new_id} — रजिस्टर में सहेजा गया। Today's Brief में देखें।")
+                # st.rerun() destroys anything rendered before it, so the
+                # confirmation is stashed and drawn on the way back in —
+                # otherwise the operator never sees their case number.
+                st.session_state["_flash"] = (
+                    f"✅ {saved_id} — रजिस्टर में सहेजा गया। Today's Brief में देखें।")
                 st.rerun()
 
         else:
