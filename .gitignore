@@ -10,3 +10,11 @@ skills-lock.json
 .DS_Store
 **/.DS_Store
 logs-*.txt
+
+# Secrets — the Supabase URL embeds the database password. Never commit.
+# Glob, not the bare name: backups/variants (.bak, .local, .old) hold the
+# same live credential and were otherwise left committable.
+.streamlit/secrets.toml*
+!.streamlit/secrets.toml.example
+# Local SQLite database + WAL sidecars
+data/
