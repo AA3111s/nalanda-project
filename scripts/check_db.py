@@ -26,8 +26,18 @@ def redacted(url: str) -> str:
         return "(unparseable URL)"
 
 
-url = db._database_url()
 print("\n=== NGIS database probe ===\n")
+try:
+    url = db._database_url()
+except db.ConfigError as cfg:
+    # Same guidance the app renders — surfaced here so the config can be
+    # validated locally BEFORE it is pasted into the Cloud secrets box.
+    print(f"  config     : INVALID\n\n  {cfg.summary}\n")
+    for step in cfg.hint:
+        print(f"    {step}")
+    print()
+    sys.exit(1)
+
 if url:
     print(f"  configured : {redacted(url)}")
 else:

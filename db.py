@@ -128,40 +128,108 @@ def _secrets_file_exists() -> bool:
 
 
 class ConfigError(RuntimeError):
-    """A database was configured but cannot be used. Never fall back."""
+    """A database was *attempted* and is unusable. Never fall back silently.
+
+    Carries `.hint`: numbered remedy steps the UI renders verbatim. Streamlit
+    Cloud redacts exception text, so app.py must catch this and draw the
+    message itself — an uncaught raise shows the operator nothing.
+    """
+
+    def __init__(self, summary: str, hint: list[str]):
+        super().__init__(summary + "  " + " ".join(hint))
+        self.summary = summary
+        self.hint = hint
+
+
+_CLOUD_BLOCK = (
+    '[database]\n'
+    'url = "postgresql://postgres.<ref>:<password>'
+    '@aws-0-<region>.pooler.supabase.com:6543/postgres?sslmode=require"'
+)
 
 
 def _database_url() -> str | None:
     """Configured Postgres URL, or None to fall back to local SQLite.
 
-    Falling back is correct ONLY when no database was configured at all.
-    If a secrets file exists but is malformed or missing database.url, that
-    is a misconfiguration and must be loud: silently degrading to SQLite
-    would write real grievances to an ephemeral container file that a
-    redeploy deletes, while the app looked perfectly healthy. That is the
-    exact data-loss mode this module was built to end.
+    Four distinct states, deliberately not conflated:
+
+      1. NGIS_DATABASE_URL set          -> use it
+      2. no secrets at all              -> None (SQLite, silent, intended)
+      3. secrets present, no [database] -> None (SQLite, silent, intended)
+      4. [database] present but broken  -> ConfigError
+
+    (2) and (3) are "no database was asked for". (4) is "a database was
+    asked for and cannot be used" — only that one may refuse to run,
+    because falling back there would write real grievances to storage a
+    redeploy deletes.
+
+    An earlier version tested only for the *presence of a secrets file* and
+    treated that as (4). Streamlit Cloud materialises a secrets file as soon
+    as ANY secret is set, so every deployment with, say, only a Gemini key
+    crashed on load. That is what took the live site down.
     """
     env = os.environ.get("NGIS_DATABASE_URL")
     if env:
         return env
     if not _secrets_file_exists():
-        return None          # genuinely unconfigured — SQLite is intended
+        return None
+
+    try:
+        # Membership first: a missing section is an ordinary outcome, not an
+        # exception, so it can never be mistaken for a broken config.
+        has_section = "database" in st.secrets
+    except Exception as exc:
+        raise ConfigError(
+            f"Your secrets could not be parsed as TOML ({type(exc).__name__}).",
+            [
+                "1. A bare connection URL is NOT valid TOML — the ':' in "
+                "'postgresql://' is read as a key name.",
+                "2. It must be a section and a quoted key, exactly:",
+                _CLOUD_BLOCK,
+                "3. On Streamlit Cloud paste that whole block into "
+                "App → ⋮ → Settings → Secrets. Locally it goes in "
+                ".streamlit/secrets.toml.",
+            ],
+        ) from exc
+
+    if not has_section:
+        return None          # secrets exist for other keys; no DB requested
+
     try:
         url = st.secrets["database"]["url"]
     except Exception as exc:
         raise ConfigError(
-            "A .streamlit/secrets.toml exists but its [database] url could "
-            f"not be read ({type(exc).__name__}: {exc}). Refusing to fall "
-            "back to local SQLite, which would silently discard real cases. "
-            "Fix the file, or remove it to run on SQLite deliberately."
+            "Your secrets have a [database] section but no readable 'url' key.",
+            ["1. Add a quoted url key under [database]:", _CLOUD_BLOCK],
         ) from exc
-    if not url or "PASSWORD" in url or "REF" in url:
+
+    if not url or not str(url).strip():
         raise ConfigError(
-            "[database] url in .streamlit/secrets.toml is empty or still "
-            "contains the example placeholders. Paste the real Supabase "
-            "connection URI, or remove the file to run on local SQLite."
+            "[database] url is empty.",
+            ["1. Paste the Supabase connection URI:", _CLOUD_BLOCK],
+        )
+    if any(tok in url for tok in ("<ref>", "<password>", "<region>",
+                                  "YOUR-PASSWORD", "YOUR_PASSWORD")):
+        raise ConfigError(
+            "[database] url still contains the example placeholders.",
+            [
+                "1. Replace <ref>, <password> and <region> with real values "
+                "— including the square brackets if you copied "
+                "'[YOUR-PASSWORD]' from the Supabase dashboard.",
+                "2. Get it from Supabase → Project Settings → Database → "
+                "Connection string → Transaction pooler.",
+            ],
         )
     return url
+
+
+def storage_is_ephemeral() -> bool:
+    """True when running on local SQLite.
+
+    On a hosted deployment that means the container filesystem: every
+    redeploy or sleep wipes it. The UI warns loudly on the strength of this.
+    """
+    return backend() == "sqlite"
 
 
 @st.cache_resource

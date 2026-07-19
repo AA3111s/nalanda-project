@@ -1087,6 +1087,18 @@ st.markdown(
 # ══════════════════════════════════════════════════════════════════════
 def heritage_masthead():
     """Bilingual Nalanda masthead — Devanagari leads, English is the subtitle."""
+    # Running on SQLite means the container filesystem, which a redeploy or a
+    # sleep wipes. That is fine locally and catastrophic on a hosted register,
+    # and the distinction is invisible from the UI — so say it outright, on
+    # every page, for as long as it is true.
+    if db.storage_is_ephemeral():
+        st.markdown(
+            '<div class="alert-warn" style="margin:0 0 14px">'
+            '⚠ <b>Temporary storage</b> — this app is running on a local file, '
+            'not the Supabase database. Cases filed now are lost on the next '
+            'restart or redeploy. Add the [database] section to your secrets '
+            'to connect.</div>',
+            unsafe_allow_html=True)
     st.markdown(f"""
     <div class="ngis-mast">
       <div class="mast-l">
@@ -1128,8 +1140,38 @@ def hero(title_en: str, title_hi: str, subtitle: str, image: str, kicker: str):
 # now a real table; session_state holds only transient UI state (the pending
 # OCR result, the API key), never the register itself.
 # ══════════════════════════════════════════════════════════════════════
-db.init_schema()
-db.seed_demo_data()   # 90 synthetic rows, written once, flagged is_demo
+try:
+    db.init_schema()
+    db.seed_demo_data()   # 90 synthetic rows, written once, flagged is_demo
+except db.ConfigError as _cfg:
+    # Streamlit Cloud redacts exception text, so an uncaught raise here shows
+    # the operator nothing but "error message is redacted" — which is how the
+    # live site went dark with no way to diagnose it. Draw the guidance
+    # ourselves: st.markdown output is never redacted.
+    _steps = "".join(
+        f'<div style="margin:8px 0 0"><code style="background:rgba(51,33,15,.06);'
+        f'padding:2px 6px;border-radius:4px;white-space:pre-wrap;font-size:11.5px">'
+        f'{_html.escape(s)}</code></div>' if s.startswith("[database]")
+        else f'<li style="margin:6px 0">{_html.escape(s.lstrip("0123456789. "))}</li>'
+        for s in _cfg.hint
+    )
+    st.markdown(f"""
+    <div class="brief-card" style="border-left:3px solid #93312B;max-width:820px;margin:60px auto">
+      <div style="font-family:'Instrument Serif',serif;font-size:24px;color:#93312B;margin-bottom:6px">
+        Database not configured
+      </div>
+      <div style="font-size:13.5px;color:#33210F;margin-bottom:14px">
+        {_html.escape(_cfg.summary)}
+      </div>
+      <ol style="font-size:12.5px;color:rgba(51,33,15,.78);padding-left:18px;margin:0">{_steps}</ol>
+      <div style="font-size:11.5px;color:rgba(51,33,15,.58);margin-top:16px;
+                  border-top:1px solid rgba(51,33,15,.09);padding-top:12px">
+        The app refuses to start rather than fall back to temporary storage,
+        which would accept real grievances and then lose them.
+        Remove the [database] section entirely to run on local SQLite on purpose.
+      </div>
+    </div>""", unsafe_allow_html=True)
+    st.stop()
 
 for _k in ("ocr_result","classify_result","_gemini_active","gemini_key"):
     if _k not in st.session_state:
