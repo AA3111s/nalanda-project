@@ -127,17 +127,41 @@ def _secrets_file_exists() -> bool:
     return any(os.path.isfile(p) for p in candidates)
 
 
+class ConfigError(RuntimeError):
+    """A database was configured but cannot be used. Never fall back."""
+
+
 def _database_url() -> str | None:
-    """Configured Postgres URL, or None to fall back to local SQLite."""
+    """Configured Postgres URL, or None to fall back to local SQLite.
+
+    Falling back is correct ONLY when no database was configured at all.
+    If a secrets file exists but is malformed or missing database.url, that
+    is a misconfiguration and must be loud: silently degrading to SQLite
+    would write real grievances to an ephemeral container file that a
+    redeploy deletes, while the app looked perfectly healthy. That is the
+    exact data-loss mode this module was built to end.
+    """
     env = os.environ.get("NGIS_DATABASE_URL")
     if env:
         return env
     if not _secrets_file_exists():
-        return None
+        return None          # genuinely unconfigured — SQLite is intended
     try:
-        return st.secrets["database"]["url"] or None
-    except Exception:
-        return None
+        url = st.secrets["database"]["url"]
+    except Exception as exc:
+        raise ConfigError(
+            "A .streamlit/secrets.toml exists but its [database] url could "
+            f"not be read ({type(exc).__name__}: {exc}). Refusing to fall "
+            "back to local SQLite, which would silently discard real cases. "
+            "Fix the file, or remove it to run on SQLite deliberately."
+        ) from exc
+    if not url or "PASSWORD" in url or "REF" in url:
+        raise ConfigError(
+            "[database] url in .streamlit/secrets.toml is empty or still "
+            "contains the example placeholders. Paste the real Supabase "
+            "connection URI, or remove the file to run on local SQLite."
+        )
+    return url
 
 
 @st.cache_resource
