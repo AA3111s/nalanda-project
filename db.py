@@ -188,14 +188,26 @@ def get_engine():
             cx.exec_driver_sql("PRAGMA busy_timeout=5000")
         return eng
 
-    # Supabase's transaction pooler (6543) is already a pooler; stacking a
-    # SQLAlchemy pool on top exhausts the free tier's connection cap.
-    if ":6543" in url or "pooler.supabase.com" in url:
-        return create_engine(url, poolclass=NullPool, future=True)
-
+    # Keep connections warm. Measured against Supabase ap-southeast-1:
+    # establishing a connection (TCP + TLS + auth) costs ~1220ms, while a
+    # query on an already-open one costs ~64ms. NullPool discards the socket
+    # after every statement, so it paid that handshake on every rerun —
+    # 2.5s to load 90 rows. A client-side pool is correct even in front of
+    # PgBouncer: the pooler exists to multiplex many clients onto few
+    # backends, not to make per-query reconnection free.
+    #
+    # Safe in PgBouncer transaction mode because SQLAlchemy+psycopg2 does not
+    # use server-side prepared statements by default. Pool stays small so
+    # several app instances cannot exhaust the tenant's client slots.
+    is_pgbouncer = ":6543" in url or "pooler.supabase.com" in url
     return create_engine(
-        url, poolclass=QueuePool, pool_size=5, max_overflow=10,
-        pool_pre_ping=True, pool_recycle=300, future=True,
+        url,
+        poolclass=QueuePool,
+        pool_size=3 if is_pgbouncer else 5,
+        max_overflow=5 if is_pgbouncer else 10,
+        pool_pre_ping=True,     # a dropped idle socket is retried, not raised
+        pool_recycle=1800 if is_pgbouncer else 300,
+        future=True,
     )
 
 
