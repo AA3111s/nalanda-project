@@ -353,11 +353,16 @@ def _compute_days_open(df: pd.DataFrame) -> pd.DataFrame:
 # letter transcription, which can be kilobytes per row — selecting it here
 # dominated load time (1.1s vs 0.2s at 100k rows) and memory for no benefit.
 # Fetch the heavy text per-case with load_case_detail() instead.
+# complainant_name/village are light String columns (unlike transcription),
+# so pulling them in is cheap and powers the applicant search + register
+# display. created_at surfaces the "date registered" (system entry), distinct
+# from filed_on ("date on the letter").
 _LIST_COLS = (
     grievances.c.id, grievances.c.case_no, grievances.c.filed_on,
     grievances.c.category, grievances.c.department, grievances.c.block,
     grievances.c.priority, grievances.c.status, grievances.c.source,
     grievances.c.is_demo, grievances.c.resolved_on,
+    grievances.c.complainant_name, grievances.c.village, grievances.c.created_at,
 )
 
 
@@ -375,7 +380,8 @@ def load_grievances(include_demo: bool = True) -> pd.DataFrame:
 
     if df.empty:
         cols = ["ID", "Date", "Category", "Department", "Block", "Priority",
-                "Status", "Days_Open", "Source", "db_id", "is_demo"]
+                "Status", "Days_Open", "Source", "db_id", "is_demo",
+                "Applicant", "Village", "Registered"]
         return pd.DataFrame({c: pd.Series(dtype="object") for c in cols})
 
     df = _compute_days_open(df)
@@ -384,8 +390,15 @@ def load_grievances(include_demo: bool = True) -> pd.DataFrame:
         "case_no": "ID", "filed_on": "Date", "category": "Category",
         "department": "Department", "block": "Block", "priority": "Priority",
         "status": "Status", "source": "Source", "id": "db_id",
+        "complainant_name": "Applicant", "village": "Village",
+        "created_at": "Registered",
     })
     df["Date"] = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d")
+    # created_at is stored UTC; show the IST calendar date it was registered on.
+    df["Registered"] = (pd.to_datetime(df["Registered"], utc=True)
+                        .dt.tz_convert("Asia/Kolkata").dt.strftime("%Y-%m-%d"))
+    df["Applicant"] = df["Applicant"].fillna("—")
+    df["Village"] = df["Village"].fillna("—")
     return df
 
 
@@ -422,6 +435,32 @@ def case_options(include_demo: bool = True, only_open: bool = True,
     stmt = stmt.order_by(grievances.c.id.desc()).limit(limit)
     with get_engine().connect() as cx:
         return pd.DataFrame(cx.execute(stmt).mappings().all())
+
+
+def find_duplicates(complainant_name: str, category: str,
+                    block: str | None = None, open_only: bool = True,
+                    limit: int = 20) -> list[dict]:
+    """Existing grievances that look like the same complaint from the same
+    person — same applicant (case-insensitive) and same category (and block,
+    when given). Read-only; the caller decides whether to warn or block.
+    Returns a list of dicts (empty when nothing matches or name is blank)."""
+    name = (complainant_name or "").strip()
+    if not name or not category:
+        return []
+    init_schema()
+    stmt = (select(grievances.c.case_no, grievances.c.filed_on,
+                   grievances.c.category, grievances.c.block,
+                   grievances.c.status, grievances.c.summary)
+            .where(grievances.c.is_demo.is_(False))
+            .where(grievances.c.complainant_name.ilike(name))
+            .where(grievances.c.category == category))
+    if block and block != "Unknown":
+        stmt = stmt.where(grievances.c.block == block)
+    if open_only:
+        stmt = stmt.where(grievances.c.status.in_(OPEN_STATUSES))
+    stmt = stmt.order_by(grievances.c.id.desc()).limit(limit)
+    with get_engine().connect() as cx:
+        return [dict(r) for r in cx.execute(stmt).mappings().all()]
 
 
 # ── writes ────────────────────────────────────────────────────────────────

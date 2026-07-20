@@ -332,6 +332,81 @@ def build_classification(combined_text, gemini_fields=None):
 
 
 # ══════════════════════════════════════════════════════════════════════
+# FORWARDING LETTER  (SDM → department official)
+# ══════════════════════════════════════════════════════════════════════
+def _letter_fields(detail):
+    """Pull the fields a forwarding letter needs from a load_case_detail row."""
+    return {
+        "case_no": str(detail.get("case_no") or "—"),
+        "name":    str(detail.get("complainant_name") or "अज्ञात / Unknown"),
+        "village": str(detail.get("village") or "—"),
+        "block":   str(detail.get("block") or "—"),
+        "category": str(detail.get("category") or "Other / Anya"),
+        "filed_on": str(detail.get("filed_on") or "—"),
+        "summary": (str(detail.get("summary") or "").strip()
+                    or str(detail.get("transcription") or "").strip()[:600] or "—"),
+    }
+
+
+def _template_letter(detail, office, officer):
+    """Offline formal forwarding letter — works with no Gemini key / on failure."""
+    f = _letter_fields(detail)
+    today = datetime.now().strftime("%d/%m/%Y")
+    return f"""अनुमंडल कार्यालय, हिलसा (नालंदा) — बिहार सरकार
+Office of the Sub-Divisional Magistrate, Hilsa (Nalanda) — Government of Bihar
+
+पत्रांक / Ref: {f['case_no']}                         दिनांक / Date: {today}
+
+सेवा में / To,
+    {officer}
+    {office}
+
+विषय / Subject: शिकायत {f['case_no']} का निष्पादन — {f['category']}
+                Redressal of grievance {f['case_no']} — {f['category']}
+
+महोदय / Sir,
+
+    उपर्युक्त विषय के संबंध में श्री/श्रीमती {f['name']} (ग्राम {f['village']}, प्रखंड
+{f['block']}) द्वारा दिनांक {f['filed_on']} को दर्ज शिकायत आपके कार्यालय को
+आवश्यक कार्रवाई हेतु अग्रेषित की जाती है।
+
+शिकायत का सारांश / Summary of grievance:
+    {f['summary']}
+
+    कृपया इस प्रकरण में नियमानुसार समयबद्ध कार्रवाई सुनिश्चित करें एवं की गई
+कार्रवाई से इस कार्यालय को अवगत कराएं।
+    You are requested to take time-bound action as per rules and to apprise
+    this office of the action taken.
+
+                                                भवदीय / Yours faithfully,
+                                                अनुमंडल पदाधिकारी, हिलसा
+                                                Sub-Divisional Magistrate, Hilsa
+"""
+
+
+def gemini_draft_letter(client_tuple, detail, office, officer):
+    """AI-drafted bilingual forwarding letter. Returns text, or None on
+    failure so the caller can fall back to _template_letter."""
+    f = _letter_fields(detail)
+    prompt = f"""You are the office of the Sub-Divisional Magistrate (SDM), Hilsa, Nalanda, Bihar.
+Draft a formal government FORWARDING LETTER from the SDM to the department official below, forwarding a citizen grievance for time-bound redressal.
+
+Write it BILINGUAL — each section in Hindi (Devanagari) followed by its English equivalent. Use the standard Indian government letter format: office header, Ref/Date, To (officer + office), Subject, salutation, body of 2-3 short paragraphs (including the grievance summary), a request for time-bound action and a report back, and a "Yours faithfully / SDM, Hilsa" close. Do NOT invent facts beyond those given. Return ONLY the letter text — no markdown, no backticks, no commentary.
+
+Case no: {f['case_no']}
+Complainant: {f['name']}
+Village / Block: {f['village']} / {f['block']}
+Category: {f['category']}
+Date filed: {f['filed_on']}
+Addressed to: {officer}, {office}
+Grievance summary: {f['summary']}"""
+    raw, err = _gemini_generate(client_tuple, prompt)
+    if err or not raw:
+        return None
+    return raw.strip()
+
+
+# ══════════════════════════════════════════════════════════════════════
 # THEME
 # ══════════════════════════════════════════════════════════════════════
 # The Manuscript Console — Madhubani heritage palette on parchment,
@@ -1354,6 +1429,8 @@ with st.sidebar:
     st.markdown("<div class='sb-cap'>फ़िल्टर · Filters</div>", unsafe_allow_html=True)
     gp = st.selectbox("Priority", ["All","High","Medium","Low"], label_visibility="collapsed")
     gb = st.selectbox("Block", ["All"]+sorted(df["Block"].unique().tolist()), label_visibility="collapsed")
+    gname = st.text_input("Search applicant", placeholder="🔍 आवेदक खोजें · Search applicant name",
+                          label_visibility="collapsed")
 
     # Demo rows are real table rows flagged is_demo; untick to read true
     # figures. Changing this re-queries on the next rerun.
@@ -1377,6 +1454,8 @@ with st.sidebar:
 fdf = df.copy()
 if gp != "All": fdf = fdf[fdf["Priority"]==gp]
 if gb != "All": fdf = fdf[fdf["Block"]==gb]
+if gname.strip() and "Applicant" in fdf.columns:
+    fdf = fdf[fdf["Applicant"].astype(str).str.contains(gname.strip(), case=False, na=False, regex=False)]
 
 # ── NAV VEIL — page-transition loader (presentation only) ─────────────
 # The single sanctioned session_state addition of the re-theme: remember
@@ -1500,10 +1579,14 @@ if selected == "Today's Brief":
         block_esc   = _html.escape(str(row["Block"]))
         status_color= RED if row["Status"]=="Open" else SAFF if row["Status"]=="In Progress" else GREEN
         status_esc  = _html.escape(str(row["Status"]))
+        applicant_esc = _html.escape(str(row.get("Applicant","—")))
+        reg_esc       = _html.escape(str(row.get("Registered","—")))
         rows_html  += (
             f"<tr>"
             f'<td style="font-family:Fira Code,monospace;color:{NAVY};font-weight:600;text-align:center">{_html.escape(str(row["ID"]))}</td>'
+            f'<td style="color:{TXT};font-weight:500">{applicant_esc}</td>'
             f'<td style="font-family:Fira Code,monospace;font-size:11px">{_html.escape(str(row["Date"]))}</td>'
+            f'<td style="font-family:Fira Code,monospace;font-size:11px;color:rgba(51,33,15,.58)">{reg_esc}</td>'
             f'<td style="color:{TXT};font-weight:500">{cat_short}</td>'
             f'<td style="color:rgba(51,33,15,.58);font-size:10.5px">{dept_short}</td>'
             f'<td style="color:{TXT}">{block_esc}</td>'
@@ -1519,7 +1602,9 @@ if selected == "Today's Brief":
       <table class="reg-table">
         <thead><tr>
           <th style="text-align:center"><span class="hi">क्र.सं.</span><span class="en">Sl. No.</span></th>
-          <th><span class="hi">दिनांक</span><span class="en">Date</span></th>
+          <th><span class="hi">आवेदक</span><span class="en">Applicant</span></th>
+          <th><span class="hi">दिनांक</span><span class="en">Date Filed</span></th>
+          <th><span class="hi">पंजीकृत</span><span class="en">Registered</span></th>
           <th><span class="hi">श्रेणी</span><span class="en">Category</span></th>
           <th><span class="hi">विभाग</span><span class="en">Department</span></th>
           <th><span class="hi">प्रखंड</span><span class="en">Block</span></th>
@@ -1606,6 +1691,41 @@ if selected == "Today's Brief":
                 f'<th><span class="hi">अधिकारी</span><span class="en">By</span></th>'
                 f'</tr></thead><tbody>{_steps}</tbody></table></div>',
                 unsafe_allow_html=True)
+
+        # ── Forwarding letter — SDM → department official ──────────────
+        st.markdown('<div class="ngis-hr"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="sec-label">अग्रेषण पत्र · Forwarding Letter '
+                    f'<span style="font-weight:400;color:{MUTED}">(SDM → संबंधित विभाग)</span></div>',
+                    unsafe_allow_html=True)
+        _letter_key = f"letter_{_gid}"
+        _gk = st.session_state.get("gemini_key", "")
+        if st.button("✉ पत्र तैयार करें · Draft forwarding letter", use_container_width=True):
+            detail = db.load_case_detail(_gid)
+            if not detail:
+                st.session_state[_letter_key] = "— प्रकरण नहीं मिला · case not found —"
+            else:
+                _cat  = detail.get("category", "Other / Anya")
+                _meta = SCHEMA.get(_cat, SCHEMA["Other / Anya"])
+                _office  = _meta["department"]
+                _officer = (_meta.get("jurisdiction", "").split("➔")[0].strip() or _office)
+                _drafted = None
+                if _gk:
+                    _ct = init_gemini(_gk)
+                    if _ct[0] is not None:
+                        with st.spinner("Gemini is drafting the official letter…"):
+                            _drafted = gemini_draft_letter(_ct, detail, _office, _officer)
+                st.session_state[_letter_key] = _drafted or _template_letter(detail, _office, _officer)
+            st.rerun()
+        if st.session_state.get(_letter_key):
+            if not _gk:
+                st.markdown('<div class="sb-meta">बिना Gemini key — मानक टेम्पलेट पत्र · No key: standard template letter (add a key for an AI-drafted letter).</div>', unsafe_allow_html=True)
+            _edited = st.text_area("Forwarding letter (editable)",
+                                   value=st.session_state[_letter_key], height=340,
+                                   label_visibility="collapsed")
+            st.session_state[_letter_key] = _edited
+            st.download_button("⬇ डाउनलोड · Download .txt", data=_edited or "",
+                               file_name=f"forwarding_{_pick.split(' ·')[0]}.txt",
+                               mime="text/plain", use_container_width=True)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1783,6 +1903,37 @@ elif selected == "Analytics Suite":
             font=dict(color="#33210F", family="'Plus Jakarta Sans', sans-serif", size=11),
         )
         st.plotly_chart(sankey, use_container_width=True, config={"displayModeBar": False})
+
+    # ── MONTH-WISE TREND (by date filed) ───────────────────────────────
+    st.markdown('<div class="ngis-hr"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="sec-label">माह-वार शिकायतें · Grievances by Month <span style="font-weight:400;color:'
+                + MUTED + '">(by date filed)</span></div>', unsafe_allow_html=True)
+    mdf = fdf.copy()
+    mdf["Month"] = pd.to_datetime(mdf["Date"], errors="coerce").dt.to_period("M").astype(str)
+    mdf = mdf[mdf["Month"] != "NaT"]
+    if mdf.empty:
+        st.markdown('<div class="sb-meta">वर्तमान फ़िल्टर के लिए कोई दिनांकित शिकायत नहीं · No dated grievances for the current filters.</div>', unsafe_allow_html=True)
+    else:
+        monthly = (mdf.groupby("Month")
+                      .agg(Total=("ID", "count"),
+                           High=("Priority", lambda s: (s == "High").sum()))
+                      .reset_index()
+                      .sort_values("Month"))
+        mfig = go.Figure()
+        mfig.add_bar(x=monthly["Month"], y=monthly["Total"], name="कुल · Total",
+                     marker_color=NAVY, hovertemplate="%{x} · %{y} total<extra></extra>")
+        mfig.add_bar(x=monthly["Month"], y=monthly["High"], name="उच्च · High priority",
+                     marker_color=RED, hovertemplate="%{x} · %{y} high<extra></extra>")
+        mfig.update_layout(
+            barmode="group", height=360, bargap=0.25,
+            margin=dict(t=10, b=10, l=8, r=8),
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#33210F", family="'Plus Jakarta Sans', sans-serif", size=11),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            xaxis=dict(title="", showgrid=False),
+            yaxis=dict(title="", gridcolor="rgba(51,33,15,.10)", rangemode="tozero"),
+        )
+        st.plotly_chart(mfig, use_container_width=True, config={"displayModeBar": False})
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -2041,6 +2192,7 @@ elif selected == "Field Capture":
                 f_text    = st.text_area("पूर्ण पाठ · Full grievance text (editable)",
                                          value=str(ocr.get("transcription", "") or ""), height=180)
                 st.caption(f"प्रेषित विभाग · Department is set automatically from the category → {_html.escape(SCHEMA[cur_cat]['department'])}")
+                f_confirm_dup = st.checkbox("पुष्टि करें: यह डुप्लिकेट नहीं है · Confirm this is NOT a duplicate (tick only if a match is flagged)")
                 submitted = st.form_submit_button("✅ रजिस्टर में सहेजें · Save to Register", use_container_width=True)
 
             if submitted:
@@ -2048,6 +2200,21 @@ elif selected == "Field Capture":
                     st.markdown('<div class="alert-high">⚠ आवेदक का नाम आवश्यक है · Applicant name is required before saving.</div>', unsafe_allow_html=True)
                 elif f_category not in SCHEMA:
                     st.markdown('<div class="alert-high">⚠ मान्य श्रेणी चुनें · Choose a valid category.</div>', unsafe_allow_html=True)
+                elif (dups := db.find_duplicates(f_name.strip(), f_category, f_block)) and not f_confirm_dup:
+                    # Same applicant + same category (+ block) already has an open
+                    # case. Warn and hold the save until the operator confirms.
+                    dup_rows = "".join(
+                        f'<li><b>{_html.escape(str(d["case_no"]))}</b> · '
+                        f'{_html.escape(str(d["category"]).split("/")[0].strip())} · '
+                        f'{_html.escape(str(d["block"]))} · {_html.escape(str(d["status"]))} · '
+                        f'{_html.escape(str(d["filed_on"]))}</li>'
+                        for d in dups)
+                    st.markdown(
+                        '<div class="alert-warn">⚠ संभावित डुप्लिकेट · Possible duplicate — this applicant '
+                        f'already has {len(dups)} open case(s) in this category:<ul style="margin:6px 0 0 18px">{dup_rows}</ul>'
+                        '<div style="margin-top:6px">यदि यह वास्तव में नई शिकायत है तो ऊपर "Confirm this is NOT a duplicate" '
+                        'पर टिक करें और पुनः सहेजें · If this really is a new grievance, tick the confirm box above and Save again.</div></div>',
+                        unsafe_allow_html=True)
                 else:
                     # Department follows the (possibly edited) category; db owns
                     # date parsing, priority normalisation and case-no assignment.
