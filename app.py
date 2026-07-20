@@ -94,7 +94,7 @@ def open_image_safe(raw_bytes: bytes, filename: str = "") -> tuple:
 # LOCAL IMPORTS
 # ══════════════════════════════════════════════════════════════════════
 from real_data import get_blocks_df, HILSA_STATS, BLOCK_CENSUS, JJM_COVERAGE, MGNREGA_DATA
-from classifier import classify_complaint, SCHEMA
+from classifier import classify_complaint, SCHEMA, get_all_categories, BLOCK_MAPPING
 from image_loader import hero_css_bg
 import db
 
@@ -166,31 +166,51 @@ def init_gemini(api_key):
         return _old, "legacy"
     except Exception: return None, None
 
-def run_gemini_ocr(client_tuple, image_bytes):
+# ── Prompts ────────────────────────────────────────────────────────
+# OCR is now transcription-only: one page in, raw text out. Field
+# extraction (name/category/…) happens once over the COMBINED text of all
+# pages in gemini_extract_fields — so a multi-page letter yields one
+# coherent record instead of N conflicting per-page guesses.
+_OCR_PROMPT = """You are an OCR assistant for Bihar government district administration.
+Read this grievance letter PAGE exactly as written.
+STRICT RULES:
+1. Transcribe ONLY what is actually written. Do NOT infer, translate, or add information.
+2. If a word is unclear write [अस्पष्ट] rather than guessing.
+3. Preserve the original script exactly — Devanagari stays Devanagari; romanised Hindi / Hinglish / English stay as written.
+Return ONLY the plain transcription text of this page — no JSON, no markdown, no backticks, no commentary."""
+
+_EXTRACT_PROMPT_TMPL = """You are a grievance-intake assistant for the Bihar district administration (Janata Darbar).
+The TEXT below is one citizen grievance (it may span several pages). It can be in Hindi (Devanagari), English, or romanised Hindi / Hinglish — e.g. "humare gaon me handpump 2 mahine se kharab hai". Understand all of these.
+
+Extract these fields and return ONLY a valid JSON object — no markdown, no backticks:
+{{
+  "complainant_name": "Full name of the person filing the grievance (or Unknown)",
+  "village": "Village / Gram name mentioned (or Unknown)",
+  "block": "Block / Prakhand / Thana / Panchayat mentioned (or Unknown)",
+  "date_filed": "Any date written in the letter, kept as written (or Unknown)",
+  "issue_summary": "One clear English sentence summarising the core problem",
+  "category": "EXACTLY one of: {cats}",
+  "priority": "High, Medium, or Low (High only for danger / health-critical / long-pending emergencies)"
+}}
+
+RULES:
+- "category" MUST be copied verbatim from the list above. If nothing fits, use "Other / Anya".
+- Never invent facts. Use "Unknown" whenever the text does not state something.
+
+TEXT:
+\"\"\"
+{text}
+\"\"\""""
+
+
+def _gemini_generate(client_tuple, prompt, image_jpeg=None):
+    """Run one prompt (optionally with one JPEG image) through the Gemini
+    model fallback chain. Returns (raw_text, error_str) — exactly one is
+    non-None. Shared by run_gemini_ocr (image) and gemini_extract_fields
+    (text), and handles both the new google.genai and legacy
+    google.generativeai SDKs."""
     client, sdk_type = (client_tuple if isinstance(client_tuple, tuple) else (client_tuple, "legacy"))
     active_model = st.session_state.get("_gemini_active", _GEMINI_CHAIN[1])
-    try:
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        buf = io.BytesIO(); img.save(buf, format="JPEG", quality=90)
-        jpeg_bytes = buf.getvalue()
-    except Exception as e: return {"error": f"Image preprocessing failed: {e}"}
-
-    prompt = """You are an OCR assistant for Bihar government district administration.
-Read this handwritten Hindi grievance letter EXACTLY as written.
-STRICT RULES:
-1. Transcribe ONLY what is actually written. Do NOT infer or add information.
-2. If a word is unclear write [अस्पष्ट] rather than guessing.
-3. Preserve original Hindi text exactly.
-Return ONLY a valid JSON object — no markdown, no backticks:
-{
-  "transcription": "Complete Hindi text exactly as written",
-  "complainant_name": "Name of person who signed (or Unknown)",
-  "village": "Village/Gram name mentioned (or Unknown)",
-  "block": "Block/Thana/Panchayat mentioned (or Unknown)",
-  "date_filed": "Date written in letter (or Unknown)",
-  "issue_summary": "One sentence summary of core problem in English"
-}"""
-
     models_to_try = [active_model] + [m for m in _GEMINI_CHAIN if m != active_model]
     _last_err = None; quota_hit = False
 
@@ -199,46 +219,116 @@ Return ONLY a valid JSON object — no markdown, no backticks:
             from google.genai import types as _types
         except ImportError:
             from google import genai as _gai_mod; _types = _gai_mod.types
-        image_part = _types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg")
+        contents = [prompt]
+        if image_jpeg is not None:
+            contents.append(_types.Part.from_bytes(data=image_jpeg, mime_type="image/jpeg"))
         for model_name in models_to_try:
             try:
-                response = client.models.generate_content(model=model_name, contents=[prompt, image_part])
-                raw = response.text.strip().replace("```json","").replace("```","").strip()
-                try: return json.loads(raw)
-                except json.JSONDecodeError:
-                    return {"transcription":response.text,"complainant_name":"Unknown","village":"Unknown",
-                            "block":"Unknown","date_filed":datetime.now().strftime("%Y-%m-%d"),
-                            "issue_summary":"Could not parse JSON"}
+                response = client.models.generate_content(model=model_name, contents=contents)
+                return response.text.strip(), None
             except Exception as _e:
                 _s = str(_e); _last_err = _s
                 if _is_quota(_s): quota_hit = True; time.sleep(5); continue
                 if _is_retryable(_s): continue
-                return {"error": f"Fatal Gemini error: {_s}"}
+                return None, f"Fatal Gemini error: {_s}"
         if quota_hit:
-            return {"error": "🚫 Gemini free-tier quota exhausted.\n\nFix: Generate a new API key at https://aistudio.google.com/apikey\n\nLast error: " + str(_last_err)}
-        return {"error": f"All models exhausted. Last error: {_last_err}"}
+            return None, "🚫 Gemini free-tier quota exhausted.\n\nFix: Generate a new API key at https://aistudio.google.com/apikey\n\nLast error: " + str(_last_err)
+        return None, f"All models exhausted. Last error: {_last_err}"
 
     import google.generativeai as _old_genai
+    img_obj = None
+    if image_jpeg is not None:
+        try:
+            img_obj = Image.open(io.BytesIO(image_jpeg)).convert("RGB")
+        except Exception as e:
+            return None, f"Image preprocessing failed: {e}"
     for model_name in models_to_try:
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 m = _old_genai.GenerativeModel(model_name)
-                response = m.generate_content([prompt, img])
-            raw = response.text.strip().replace("```json","").replace("```","").strip()
-            try: return json.loads(raw)
-            except json.JSONDecodeError:
-                return {"transcription":response.text,"complainant_name":"Unknown","village":"Unknown",
-                        "block":"Unknown","date_filed":datetime.now().strftime("%Y-%m-%d"),
-                        "issue_summary":"Could not parse JSON"}
+                content = [prompt, img_obj] if img_obj is not None else prompt
+                response = m.generate_content(content)
+            return response.text.strip(), None
         except Exception as _e:
             _s = str(_e); _last_err = _s
             if _is_quota(_s): quota_hit = True; time.sleep(5); continue
             if _is_retryable(_s): continue
-            return {"error": f"Fatal Gemini error: {_s}"}
+            return None, f"Fatal Gemini error: {_s}"
     if quota_hit:
-        return {"error": "🚫 Quota exhausted.\n\nGet new key: https://aistudio.google.com/apikey\n\nLast error: " + str(_last_err)}
-    return {"error": f"All models exhausted. Last: {_last_err}"}
+        return None, "🚫 Quota exhausted.\n\nGet new key: https://aistudio.google.com/apikey\n\nLast error: " + str(_last_err)
+    return None, f"All models exhausted. Last: {_last_err}"
+
+
+def run_gemini_ocr(client_tuple, image_bytes):
+    """One image / page → plain transcription. Returns
+    {"transcription": ...} on success or {"error": ...}."""
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        buf = io.BytesIO(); img.save(buf, format="JPEG", quality=90)
+        jpeg_bytes = buf.getvalue()
+    except Exception as e:
+        return {"error": f"Image preprocessing failed: {e}"}
+    raw, err = _gemini_generate(client_tuple, _OCR_PROMPT, image_jpeg=jpeg_bytes)
+    if err:
+        return {"error": err}
+    return {"transcription": raw}
+
+
+def gemini_extract_fields(client_tuple, text):
+    """Combined transcription / typed Hinglish text → structured fields
+    (name, village, block, date, summary, category, priority). Returns the
+    parsed dict, or {"error": ...} on API failure. On unparseable output it
+    returns empty fields so the caller falls back to classify_complaint."""
+    prompt = _EXTRACT_PROMPT_TMPL.format(cats=", ".join(get_all_categories()), text=text)
+    raw, err = _gemini_generate(client_tuple, prompt)
+    if err:
+        return {"error": err}
+    cleaned = raw.replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        return {"complainant_name": "Unknown", "village": "Unknown", "block": "Unknown",
+                "date_filed": "Unknown", "issue_summary": "", "category": "", "priority": ""}
+
+
+def build_classification(combined_text, gemini_fields=None):
+    """Baseline rule-based classification (also the source of routing
+    metadata — department, jurisdiction, schemes), with any Gemini-provided
+    fields overlaid on top. When Gemini supplies a valid category, the
+    department/icon/jurisdiction/schemes are re-derived from SCHEMA so
+    routing always matches the chosen category. Falls back cleanly to the
+    keyword classifier when there are no Gemini fields (no key / failure)."""
+    clf = classify_complaint(combined_text or "")
+    if not gemini_fields or "error" in gemini_fields:
+        return clf
+
+    for field in ("complainant_name", "village", "block", "date_filed"):
+        val = str(gemini_fields.get(field, "") or "").strip()
+        if val and val.lower() != "unknown":
+            clf[field] = val
+
+    pri = str(gemini_fields.get("priority", "") or "").strip().capitalize()
+    if pri in ("High", "Medium", "Low"):
+        clf["priority"] = pri
+
+    summary = str(gemini_fields.get("issue_summary", "") or "").strip()
+    if summary:
+        clf["issue_summary"] = summary
+
+    cat = str(gemini_fields.get("category", "") or "").strip()
+    if cat in SCHEMA:
+        meta = SCHEMA[cat]
+        clf["category"]        = cat
+        clf["icon"]            = meta["icon"]
+        clf["department"]      = meta["department"]
+        clf["jurisdiction"]    = meta["jurisdiction"]
+        clf["central_schemes"] = meta["central_schemes"]
+        clf["bihar_schemes"]   = meta["bihar_schemes"]
+        # Gemini made a considered choice over the full text — reflect that
+        # rather than the keyword score, which was for a different category.
+        clf["confidence"] = max(float(clf.get("confidence", 0.0) or 0.0), 0.9)
+    return clf
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1719,64 +1809,118 @@ elif selected == "Field Capture":
     with left:
         if input_mode == "📷  Scan Letter (Image)":
             st.markdown('<div class="sec-label">दस्तावेज़ अपलोड करें · Upload Document</div>', unsafe_allow_html=True)
-            upload_option=st.radio("",["📁  Upload file","📷  Camera"],horizontal=True,label_visibility="collapsed")
-            img_bytes=None
+            upload_option=st.radio("",["📁  Upload file(s)","📷  Camera"],horizontal=True,label_visibility="collapsed")
+            page_images=[]            # ordered list of JPEG page-bytes; a multi-page letter = one grievance
             heic_ok = _HEIC_OK or _LIBHEIF_OK
 
-            if upload_option == "📁  Upload file":
+            if upload_option == "📁  Upload file(s)":
                 if not heic_ok:
                     st.markdown('<div class="alert-warn">⚠ HEIC support unavailable — JPG &amp; PNG work fine\nFix: pip install pillow-heif → restart Streamlit</div>', unsafe_allow_html=True)
                     allowed_types=["jpg","jpeg","png"]
                 else:
                     allowed_types=["jpg","jpeg","png","heic","heif"]
-                uploaded=st.file_uploader("",type=allowed_types,label_visibility="collapsed")
+                st.markdown('<div class="sb-meta">एक से अधिक पृष्ठ चुनें · Upload every page of a multi-page complaint</div>', unsafe_allow_html=True)
+                uploaded=st.file_uploader("",type=allowed_types,label_visibility="collapsed",accept_multiple_files=True)
                 if uploaded:
-                    raw=uploaded.read()
-                    img,err=open_image_safe(raw,uploaded.name)
-                    if err: st.error(f"Could not open image: {err}")
-                    else:
-                        buf=io.BytesIO(); img.save(buf,format="JPEG",quality=85); img_bytes=buf.getvalue()
-                        st.image(img_bytes,caption=f"✅ {uploaded.name} — ready for OCR",use_column_width=True)
+                    for uf in uploaded:
+                        raw=uf.read()
+                        img,err=open_image_safe(raw,uf.name)
+                        if err: st.error(f"Could not open {uf.name}: {err}")
+                        else:
+                            buf=io.BytesIO(); img.save(buf,format="JPEG",quality=85); page_images.append(buf.getvalue())
+                    if page_images:
+                        st.markdown(f'<div class="sb-meta" style="color:{GREEN}">✅ {len(page_images)} page(s) ready for OCR</div>', unsafe_allow_html=True)
+                        thumb_cols=st.columns(min(len(page_images),3))
+                        for i,pb in enumerate(page_images):
+                            with thumb_cols[i%len(thumb_cols)]:
+                                st.image(pb,caption=f"Page {i+1}/{len(page_images)}",use_column_width=True)
             else:
                 cam=st.camera_input("",label_visibility="collapsed")
                 if cam:
                     raw_cam=cam.read(); img_cam,err_cam=open_image_safe(raw_cam,"camera.jpg")
                     if err_cam: st.error(f"Camera error: {err_cam}")
                     else:
-                        buf=io.BytesIO(); img_cam.save(buf,format="JPEG",quality=85); img_bytes=buf.getvalue()
-                        st.image(img_bytes,use_column_width=True)
+                        buf=io.BytesIO(); img_cam.save(buf,format="JPEG",quality=85); page_images=[buf.getvalue()]
+                        st.image(page_images[0],use_column_width=True)
 
-            if img_bytes:
+            if page_images:
+                n_pages=len(page_images)
                 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
                 if not gemini_key_val:
                     st.markdown('<div class="alert-high">⚠ Add Gemini API key in sidebar to enable OCR.\nGet free key: https://aistudio.google.com/apikey</div>', unsafe_allow_html=True)
                 else:
-                    if st.button("🔍 पत्र पढ़ें · Process with Gemini OCR", use_container_width=True):
-                        with st.spinner(f"Gemini ({active_model}) is reading the Hindi letter…"):
-                            client_tuple=init_gemini(gemini_key_val)
-                            client,sdk_type=client_tuple
-                            if client is None:
-                                st.markdown('<div class="alert-high">⚠ Failed to initialise Gemini.\nCheck API key: https://aistudio.google.com/apikey</div>', unsafe_allow_html=True)
+                    btn_label=("🔍 पत्र पढ़ें · Process with Gemini OCR" if n_pages==1
+                               else f"🔍 {n_pages} पृष्ठ पढ़ें · Process {n_pages} pages with Gemini OCR")
+                    if st.button(btn_label, use_container_width=True):
+                        client_tuple=init_gemini(gemini_key_val)
+                        client,sdk_type=client_tuple
+                        if client is None:
+                            st.markdown('<div class="alert-high">⚠ Failed to initialise Gemini.\nCheck API key: https://aistudio.google.com/apikey</div>', unsafe_allow_html=True)
+                        else:
+                            # Stage 1 — OCR each page to plain text.
+                            transcripts=[]; ocr_err=None
+                            prog=st.progress(0.0)
+                            for i,pb in enumerate(page_images):
+                                with st.spinner(f"Gemini ({active_model}) reading page {i+1} of {n_pages}…"):
+                                    res=run_gemini_ocr(client_tuple,pb)
+                                if "error" in res: ocr_err=res["error"]; break
+                                transcripts.append((res.get("transcription") or "").strip())
+                                prog.progress((i+1)/n_pages)
+                            prog.empty()
+                            if ocr_err:
+                                cls="alert-warn" if "quota" in ocr_err.lower() or "429" in ocr_err else "alert-high"
+                                st.markdown(f'<div class="{cls}">{_html.escape(ocr_err)}</div>', unsafe_allow_html=True)
                             else:
-                                result=run_gemini_ocr(client_tuple,img_bytes)
-                                if "error" not in result:
-                                    st.session_state.ocr_result=result
-                                    clf=classify_complaint(result.get("transcription",""))
-                                    for field in ("block","village","complainant_name","date_filed"):
-                                        if result.get(field,"Unknown")!="Unknown": clf[field]=result[field]
+                                combined=(transcripts[0] if n_pages==1
+                                          else "\n\n".join(f"--- पृष्ठ / Page {i+1} ---\n{t}" for i,t in enumerate(transcripts)))
+                                # Stage 2 — one extraction pass over the whole letter.
+                                with st.spinner("Gemini is extracting applicant, category & routing…"):
+                                    fields=gemini_extract_fields(client_tuple,combined)
+                                if "error" in fields:
+                                    ferr=fields["error"]
+                                    cls="alert-warn" if "quota" in ferr.lower() or "429" in ferr else "alert-high"
+                                    st.markdown(f'<div class="{cls}">{_html.escape(ferr)}</div>', unsafe_allow_html=True)
+                                else:
+                                    clf=build_classification(combined,fields)
+                                    st.session_state.ocr_result={
+                                        "transcription":combined,
+                                        "issue_summary":fields.get("issue_summary") or clf.get("issue_summary") or "",
+                                        "source":f"OCR / Gemini ({n_pages}p)" if n_pages>1 else "OCR / Gemini",
+                                        "complainant_name":clf.get("complainant_name","Unknown"),
+                                        "village":clf.get("village","Unknown"),
+                                        "block":clf.get("block","Unknown"),
+                                        "date_filed":clf.get("date_filed","Unknown"),
+                                    }
                                     st.session_state.classify_result=clf
                                     st.rerun()
-                                else:
-                                    err_msg=result["error"]
-                                    cls="alert-warn" if "quota" in err_msg.lower() or "429" in err_msg else "alert-high"
-                                    st.markdown(f'<div class="{cls}">{_html.escape(err_msg)}</div>', unsafe_allow_html=True)
         else:
             st.markdown('<div class="sec-label">शिकायत पाठ दर्ज करें · Input Grievance Text</div>', unsafe_allow_html=True)
-            raw_text=st.text_area("",height=220,placeholder="हमारे गाँव में पानी की सप्लाई बंद है…",label_visibility="collapsed")
+            st.markdown('<div class="sb-meta">Hindi · English · Hinglish — जैसे "humare gaon me handpump kharab hai"</div>', unsafe_allow_html=True)
+            raw_text=st.text_area("",height=220,placeholder="हमारे गाँव में पानी की सप्लाई बंद है… / humare gaon me pani nahi aa raha",label_visibility="collapsed")
             if st.button("वर्गीकृत करें · Classify & Route →", use_container_width=True):
                 if raw_text.strip():
-                    clf=classify_complaint(raw_text)
-                    st.session_state.ocr_result={"transcription":raw_text,"issue_summary":"Manual entry","source":"Manual","complainant_name":clf.get("complainant_name","Unknown"),"village":clf.get("village","Unknown"),"block":clf.get("block","Unknown"),"date_filed":clf.get("date_filed","Unknown")}
+                    # Prefer Gemini (Hinglish + smart category) when a key is set;
+                    # fall back to the keyword classifier otherwise or on failure.
+                    fields=None
+                    if gemini_key_val:
+                        client_tuple=init_gemini(gemini_key_val)
+                        client,_=client_tuple
+                        if client is not None:
+                            with st.spinner(f"Gemini ({active_model}) is understanding the grievance…"):
+                                fields=gemini_extract_fields(client_tuple,raw_text)
+                            if "error" in fields:
+                                st.markdown(f'<div class="alert-warn">Gemini unavailable — using keyword classifier.\n{_html.escape(fields["error"])}</div>', unsafe_allow_html=True)
+                                fields=None
+                    clf=build_classification(raw_text,fields)
+                    st.session_state.ocr_result={
+                        "transcription":raw_text,
+                        "issue_summary":(fields.get("issue_summary") if fields else "") or clf.get("issue_summary") or "Manual entry",
+                        "source":"Manual + Gemini" if fields else "Manual",
+                        "complainant_name":clf.get("complainant_name","Unknown"),
+                        "village":clf.get("village","Unknown"),
+                        "block":clf.get("block","Unknown"),
+                        "date_filed":clf.get("date_filed","Unknown"),
+                    }
                     st.session_state.classify_result=clf
                     st.rerun()
 
@@ -1807,23 +1951,10 @@ elif selected == "Field Capture":
             new_id   = "— on save —"
             reg_date = datetime.now().strftime("%d/%m/%Y")
 
-            # ── Safely escape ALL dynamic values before they touch HTML ──
-            e_name    = _html.escape(str(clf.get("complainant_name","Unknown")))
-            e_village = _html.escape(str(clf.get("village","Unknown")))
-            e_block   = _html.escape(str(clf.get("block","Unknown")))
-            e_dept    = _html.escape(str(clf["department"]))
-            e_cat     = _html.escape(f"{clf['icon']} {clf['category']}")
+            # Values still baked into read-only HTML (header + routing panel).
             e_id      = _html.escape(new_id)
             priority  = clf["priority"]
-            conf      = int(clf["confidence"]*100)
-            pri_cls   = "pri-high" if priority=="High" else "pri-normal"
-
-            # Summary — escape it; if it contains <> from Gemini output it won't corrupt HTML
-            raw_summary = ocr.get("issue_summary","")
-            if raw_summary and raw_summary not in ("Manual entry","Manually entered text"):
-                e_summary = _html.escape(raw_summary)
-            else:
-                e_summary = "—"
+            conf      = int(float(clf.get("confidence", 0.0) or 0.0) * 100)
 
             # Jurisdiction chain
             jur_steps  = clf.get("jurisdiction","").split(" ➔ ")
@@ -1870,56 +2001,92 @@ elif selected == "Field Capture":
                         unsafe_allow_html=True
                     )
 
-            st.markdown('<div class="sec-label" style="margin-top:14px">पत्रावली प्रविष्टि · Register Entry</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="sec-label" style="margin-top:14px">पत्रावली प्रविष्टि · Register Entry <span style="font-weight:400;color:{MUTED}">— संपादन योग्य / editable before you save</span></div>', unsafe_allow_html=True)
 
-            # ── THE REGISTER TICKET  (NO HTML comments — that was the bug) ──
+            # Decorative office header only — every data field is now an
+            # editable widget in the form below, not baked into read-only HTML.
             st.markdown(f"""
-<div class="reg-ticket">
+<div class="reg-ticket" style="padding-bottom:2px">
   <div class="reg-ticket-header">
     <div class="reg-ticket-h1">अनुमंडल कार्यालय, हिलसा (नालंदा)</div>
     <div class="reg-ticket-h2">Sub-Divisional Office, Hilsa (Nalanda) · Bihar Government</div>
-    <div class="reg-ticket-h3">जनता दरबार — शिकायत पत्रावली रजिस्टर</div>
+    <div class="reg-ticket-h3">जनता दरबार — शिकायत पत्रावली रजिस्टर · क्र.सं. {e_id} · दिनांक {reg_date}</div>
   </div>
-  <table>
-    <tr>
-      <td class="lbl"><span class="hi">क्र.सं.</span><span class="en">Sl. No.</span></td>
-      <td class="val mono" style="font-weight:600;color:{NAVY};font-size:16px">{e_id}</td>
-      <td class="lbl"><span class="hi">दिनांक</span><span class="en">Date</span></td>
-      <td class="val mono">{reg_date}</td>
-    </tr>
-    <tr>
-      <td class="lbl"><span class="hi">आवेदक</span><span class="en">Applicant</span></td>
-      <td class="val">{e_name}</td>
-      <td class="lbl"><span class="hi">ग्राम / प्रखंड</span><span class="en">Village / Block</span></td>
-      <td class="val">{e_village} · {e_block}</td>
-    </tr>
-    <tr>
-      <td class="lbl"><span class="hi">शिकायत श्रेणी</span><span class="en">Category</span></td>
-      <td class="val">{e_cat} &nbsp;<span style="font-size:10px;color:{MUTED}">Conf: {conf}%</span></td>
-      <td class="lbl"><span class="hi">प्राथमिकता</span><span class="en">Priority</span></td>
-      <td class="val"><span class="pri-stamp {pri_cls}">{priority}</span></td>
-    </tr>
-    <tr>
-      <td class="lbl"><span class="hi">विषय</span><span class="en">Subject</span></td>
-      <td class="val" colspan="3" style="font-family:Noto Sans,sans-serif">{e_summary}</td>
-    </tr>
-    <tr>
-      <td class="lbl"><span class="hi">प्रेषित विभाग</span><span class="en">Dept. Forwarded</span></td>
-      <td class="val" colspan="3">{e_dept}</td>
-    </tr>
-  </table>
+</div>""", unsafe_allow_html=True)
+
+            # ── Editable option lists, with the detected value guaranteed present ──
+            block_opts = sorted(BLOCK_MAPPING.keys()) + ["Unknown"]
+            cur_block  = str(clf.get("block", "Unknown") or "Unknown")
+            if cur_block not in block_opts: block_opts = [cur_block] + block_opts
+            cat_opts = get_all_categories()
+            cur_cat  = str(clf.get("category", cat_opts[-1]))
+            if cur_cat not in cat_opts: cur_cat = cat_opts[-1]
+            pri_opts = ["High", "Medium", "Low"]
+            cur_pri  = db.normalise_priority(clf.get("priority", "Medium"))
+            if cur_pri not in pri_opts: cur_pri = "Medium"
+
+            # A Streamlit form batches every edit and only fires on submit, so
+            # editing one field never triggers a rerun that wipes the others.
+            with st.form("register_form", clear_on_submit=False):
+                fc1, fc2 = st.columns(2)
+                with fc1:
+                    f_name     = st.text_input("आवेदक · Applicant", value=str(clf.get("complainant_name", "") or ""))
+                    f_village  = st.text_input("ग्राम · Village", value=str(clf.get("village", "") or ""))
+                    f_category = st.selectbox("शिकायत श्रेणी · Category", cat_opts, index=cat_opts.index(cur_cat))
+                with fc2:
+                    f_date     = st.text_input("दिनांक · Date filed", value=str(clf.get("date_filed", "") or ""))
+                    f_block    = st.selectbox("प्रखंड · Block", block_opts, index=block_opts.index(cur_block))
+                    f_priority = st.selectbox("प्राथमिकता · Priority", pri_opts, index=pri_opts.index(cur_pri))
+                f_subject = st.text_input("विषय · Subject / summary", value=str(ocr.get("issue_summary", "") or ""))
+                f_text    = st.text_area("पूर्ण पाठ · Full grievance text (editable)",
+                                         value=str(ocr.get("transcription", "") or ""), height=180)
+                st.caption(f"प्रेषित विभाग · Department is set automatically from the category → {_html.escape(SCHEMA[cur_cat]['department'])}")
+                submitted = st.form_submit_button("✅ रजिस्टर में सहेजें · Save to Register", use_container_width=True)
+
+            if submitted:
+                if not f_name.strip() or f_name.strip().lower() == "unknown":
+                    st.markdown('<div class="alert-high">⚠ आवेदक का नाम आवश्यक है · Applicant name is required before saving.</div>', unsafe_allow_html=True)
+                elif f_category not in SCHEMA:
+                    st.markdown('<div class="alert-high">⚠ मान्य श्रेणी चुनें · Choose a valid category.</div>', unsafe_allow_html=True)
+                else:
+                    # Department follows the (possibly edited) category; db owns
+                    # date parsing, priority normalisation and case-no assignment.
+                    saved_id = db.insert_grievance({
+                        "date_filed":       f_date.strip() or None,
+                        "category":         f_category,
+                        "department":       SCHEMA[f_category]["department"],
+                        "block":            f_block or "Unknown",
+                        "priority":         f_priority,
+                        "status":           "Open",
+                        "source":           ocr.get("source", "OCR / Gemini"),
+                        "complainant_name": f_name.strip(),
+                        "village":          f_village.strip() or None,
+                        "summary":          f_subject.strip() or None,
+                        "transcription":    f_text.strip() or None,
+                        "confidence":       clf.get("confidence"),
+                    })
+                    st.session_state.ocr_result=None; st.session_state.classify_result=None
+                    # st.rerun() destroys anything rendered before it, so the
+                    # confirmation is stashed and drawn on the way back in —
+                    # otherwise the operator never sees their case number.
+                    st.session_state["_flash"] = (
+                        f"✅ {saved_id} — रजिस्टर में सहेजा गया। Today's Brief में देखें।")
+                    st.rerun()
+
+            # ── Read-only routing reference (reflects the detected category;
+            #    final routing follows whatever category is saved above) ──
+            st.markdown(f'<div class="sec-label" style="margin-top:14px">प्रस्तावित रूटिंग · Suggested Routing <span style="font-weight:400;color:{MUTED}">(for detected category · Conf {conf}%)</span></div>', unsafe_allow_html=True)
+            st.markdown(f"""
+<div class="reg-ticket" style="padding-top:12px">
   <div class="section-hdr">प्रेषण · Forwarding Officers (प्रथम: {first_prashan})</div>
   <div class="prashan-row">{prashan_html}</div>
   <div class="section-hdr">न्यायाधिकार क्षेत्र · Jurisdiction Chain</div>
-  <div style="border:1px solid rgba(51,33,15,.09);padding:12px">
-    <div class="jur-chain-light">{jur_html}</div>
-  </div>
+  <div style="border:1px solid rgba(51,33,15,.09);padding:12px"><div class="jur-chain-light">{jur_html}</div></div>
   <div class="section-hdr">संबंधित योजनाएं · Applicable Schemes</div>
   <div style="border:1px solid rgba(51,33,15,.09);padding:12px">{schemes_html}</div>
-</div>
-""", unsafe_allow_html=True)
+</div>""", unsafe_allow_html=True)
 
-            # Escalation / routing instruction
+            # Escalation / routing instruction (detected priority)
             dept_route = clf["department"].split("(")[0].strip()
             if priority == "High":
                 esc_msg = "⚠ अत्यावश्यक — SDO कार्यालय को 24 घंटे के भीतर अग्रेषित करें। Collector साप्ताहिक समीक्षा में शामिल करें।\nHIGH PRIORITY — Escalate to SDO within 24 hours. Flag for Collector's weekly review."
@@ -1928,33 +2095,6 @@ elif selected == "Field Capture":
                 esc_msg = f"→ {dept_route} को अग्रेषित करें। VB-GRAM-G अनुसार मानक SLA लागू।\nRoute to {dept_route}. Standard SLA applies under VB-GRAM-G mandate."
                 esc_cls = "alert-normal"
             st.markdown(f'<div class="{esc_cls}">{_html.escape(esc_msg)}</div>', unsafe_allow_html=True)
-
-            st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-            if st.button("✅ रजिस्टर में सहेजें · Save to NGIS Register", use_container_width=True):
-                # db.insert_grievance owns date parsing, priority
-                # normalisation ("Normal" -> "Medium") and case-number
-                # assignment; the number comes back from the transaction.
-                saved_id = db.insert_grievance({
-                    "date_filed":       clf.get("date_filed"),
-                    "category":         clf["category"],
-                    "department":       clf["department"],
-                    "block":            clf.get("block", "Unknown"),
-                    "priority":         clf["priority"],
-                    "status":           "Open",
-                    "source":           ocr.get("source", "OCR / Gemini"),
-                    "complainant_name": clf.get("complainant_name"),
-                    "village":          clf.get("village"),
-                    "summary":          ocr.get("issue_summary"),
-                    "transcription":    ocr.get("transcription"),
-                    "confidence":       clf.get("confidence"),
-                })
-                st.session_state.ocr_result=None; st.session_state.classify_result=None
-                # st.rerun() destroys anything rendered before it, so the
-                # confirmation is stashed and drawn on the way back in —
-                # otherwise the operator never sees their case number.
-                st.session_state["_flash"] = (
-                    f"✅ {saved_id} — रजिस्टर में सहेजा गया। Today's Brief में देखें।")
-                st.rerun()
 
         else:
             st.markdown("""

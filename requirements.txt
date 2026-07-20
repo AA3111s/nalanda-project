@@ -11,3 +11,16 @@ statsmodels
 # prebuilt wheels for the pinned pillow/pandas/numpy and will source-build.
 SQLAlchemy>=2.0,<3
 psycopg2-binary==2.9.9
+
+# Image + OCR intake (app.py). Pillow is pinned explicitly (was only
+# transitive via streamlit). pillow-heif ships self-contained manylinux
+# wheels that bundle libheif, so HEIC/iPhone photos decode on Streamlit
+# Cloud with no apt packages.txt. google-genai is the Gemini SDK the OCR
+# path imports (`from google import genai`); without it OCR silently fails
+# in production. All pinned for Python 3.12 wheel availability.
+Pillow==10.4.0
+pillow-heif==0.18.0
+google-genai==1.38.0
+# Pin pydantic to a stable release — the resolver otherwise pulled a
+# 2.14 alpha for google-genai, which we don't want on Streamlit Cloud.
+pydantic>=2.7,<2.14
