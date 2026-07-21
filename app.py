@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 from streamlit_option_menu import option_menu
 import pandas as pd
 import plotly.express as px
@@ -404,6 +405,39 @@ Grievance summary: {f['summary']}"""
     if err or not raw:
         return None
     return raw.strip()
+
+
+def _copy_button(text, key, label="📋 पत्र कॉपी करें · Copy letter"):
+    """Parchment-styled clipboard button. Copies `text` (as embedded at render
+    time = the current edited letter) using a hidden textarea + execCommand, which
+    works inside Streamlit's component iframe where navigator.clipboard is often
+    blocked. `key` keeps the component id unique when rendered inside a loop."""
+    payload   = json.dumps(text or "")
+    label_js  = json.dumps(label)
+    btn_id    = f"cb_{key}"
+    components.html(f"""
+      <button id="{btn_id}" style="width:100%;padding:9px 14px;cursor:pointer;
+          font-family:'Fira Code','Noto Sans Devanagari',monospace;font-size:13px;
+          font-weight:600;color:#2C4B8F;background:#FBF3E0;
+          border:1.5px solid #2C4B8F;border-radius:7px;letter-spacing:.2px;">
+        {_html.escape(label)}
+      </button>
+      <script>
+        (function() {{
+          const t = {payload};
+          const b = document.getElementById("{btn_id}");
+          b.onclick = function() {{
+            const ta = document.createElement('textarea');
+            ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';
+            document.body.appendChild(ta); ta.focus(); ta.select();
+            try {{ document.execCommand('copy'); }} catch (e) {{}}
+            document.body.removeChild(ta);
+            b.textContent = 'Copied ✓';
+            setTimeout(function() {{ b.textContent = {label_js}; }}, 1500);
+          }};
+        }})();
+      </script>
+    """, height=48)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1386,8 +1420,8 @@ with st.sidebar:
 
     selected = option_menu(
         menu_title=None,
-        options=["Today's Brief","Analytics Suite","Field Capture","Scheme Intelligence"],
-        icons=["grid-fill","bar-chart-fill","camera-fill","building-fill"],
+        options=["Today's Brief","Complaints","Analytics Suite","Field Capture","Scheme Intelligence"],
+        icons=["grid-fill","card-list","bar-chart-fill","camera-fill","building-fill"],
         default_index=0,
         styles={
             "container":         {"padding":"0px 4px","background-color":"transparent","backgroundColor":"transparent"},
@@ -1692,46 +1726,120 @@ if selected == "Today's Brief":
                 f'</tr></thead><tbody>{_steps}</tbody></table></div>',
                 unsafe_allow_html=True)
 
-        # ── Forwarding letter — SDM → department official ──────────────
-        st.markdown('<div class="ngis-hr"></div>', unsafe_allow_html=True)
-        st.markdown('<div class="sec-label">अग्रेषण पत्र · Forwarding Letter '
-                    f'<span style="font-weight:400;color:{MUTED}">(SDM → संबंधित विभाग)</span></div>',
-                    unsafe_allow_html=True)
-        _letter_key = f"letter_{_gid}"
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# PAGE 2 — COMPLAINTS REGISTER (click-to-preview + forwarding letter)
+# ══════════════════════════════════════════════════════════════════════
+elif selected == "Complaints":
+
+    st.markdown('<div class="tricolor-strip"></div>', unsafe_allow_html=True)
+    heritage_masthead()
+    hero("Complaint Register", "शिकायत रजिस्टर",
+         "Every registered grievance · click to preview details & draft its forwarding letter",
+         "nalanda_ruins", "Full Register")
+
+    st.markdown('<div class="ngis-body">', unsafe_allow_html=True)
+
+    reg = fdf.sort_values("db_id") if "db_id" in fdf.columns else fdf
+    st.markdown('<div class="sec-label">समस्त पंजीकृत शिकायतें · All Registered Complaints '
+                f'<span style="font-weight:400;color:{MUTED}">(क्रम संख्यानुसार · by serial no)</span></div>',
+                unsafe_allow_html=True)
+    st.markdown(f'<div class="sb-meta">{len(reg)} शिकायतें · complaints in view — '
+                'sidebar filters (applicant search · block · priority) narrow this register.'
+                '</div>', unsafe_allow_html=True)
+
+    if reg.empty:
+        st.markdown("<div class='good-block'>कोई शिकायत नहीं · No complaints match the "
+                    "current filters.</div>", unsafe_allow_html=True)
+    else:
         _gk = st.session_state.get("gemini_key", "")
-        if st.button("✉ पत्र तैयार करें · Draft forwarding letter", use_container_width=True):
-            detail = db.load_case_detail(_gid)
-            if not detail:
-                st.session_state[_letter_key] = "— प्रकरण नहीं मिला · case not found —"
-            else:
-                _cat  = detail.get("category", "Other / Anya")
-                _meta = SCHEMA.get(_cat, SCHEMA["Other / Anya"])
-                _office  = _meta["department"]
-                _officer = (_meta.get("jurisdiction", "").split("➔")[0].strip() or _office)
-                _drafted = None
-                if _gk:
-                    _ct = init_gemini(_gk)
-                    if _ct[0] is not None:
-                        with st.spinner("Gemini is drafting the official letter…"):
-                            _drafted = gemini_draft_letter(_ct, detail, _office, _officer)
-                st.session_state[_letter_key] = _drafted or _template_letter(detail, _office, _officer)
-            st.rerun()
-        if st.session_state.get(_letter_key):
-            if not _gk:
-                st.markdown('<div class="sb-meta">बिना Gemini key — मानक टेम्पलेट पत्र · No key: standard template letter (add a key for an AI-drafted letter).</div>', unsafe_allow_html=True)
-            _edited = st.text_area("Forwarding letter (editable)",
-                                   value=st.session_state[_letter_key], height=340,
-                                   label_visibility="collapsed")
-            st.session_state[_letter_key] = _edited
-            st.download_button("⬇ डाउनलोड · Download .txt", data=_edited or "",
-                               file_name=f"forwarding_{_pick.split(' ·')[0]}.txt",
-                               mime="text/plain", use_container_width=True)
+        for r in reg.itertuples():
+            _cat_short  = str(r.Category).split("/")[0].strip()
+            _status_col = (RED if r.Status == "Open"
+                           else SAFF if r.Status == "In Progress" else GREEN)
+            _pri_sym    = "▲" if r.Priority == "High" else "►" if r.Priority == "Medium" else "●"
+            _label = f"{r.ID}  ·  {r.Applicant}  ·  {_cat_short}  ·  [{r.Status}]"
+
+            with st.expander(_label, expanded=False):
+                _dept_short = str(r.Department).split("(")[0].strip()
+                _summary    = str(getattr(r, "Summary", "") or "—").strip() or "—"
+                _rows = [
+                    ("आवेदक · Applicant", str(r.Applicant)),
+                    ("ग्राम · Village", str(r.Village)),
+                    ("प्रखंड · Block", str(r.Block)),
+                    ("विभाग · Department", _dept_short),
+                    ("श्रेणी · Category", str(r.Category)),
+                    ("प्राथमिकता · Priority", f"{_pri_sym} {r.Priority}"),
+                    ("दिनांक · Date Filed", str(r.Date)),
+                    ("पंजीकृत · Registered", str(r.Registered)),
+                    ("आयु · Age", f"{r.Days_Open}d"),
+                ]
+                _cells = "".join(
+                    f'<div style="padding:5px 0"><span style="color:{MUTED};font-size:10.5px;'
+                    f'letter-spacing:.3px">{_html.escape(k)}</span><br>'
+                    f'<span style="color:{WHITE};font-weight:500;font-size:12.5px">'
+                    f'{_html.escape(v)}</span></div>'
+                    for k, v in _rows
+                )
+                st.markdown(
+                    f'<div class="reg-wrap" style="padding:12px 16px">'
+                    f'<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:2px 22px">'
+                    f'{_cells}</div>'
+                    f'<div style="margin-top:10px;padding-top:10px;border-top:1px solid {LGRID}">'
+                    f'<span style="color:{MUTED};font-size:10.5px">स्थिति · Status: </span>'
+                    f'<span style="color:{_status_col};font-weight:600;font-size:12.5px">'
+                    f'{_html.escape(str(r.Status))}</span></div>'
+                    f'<div style="margin-top:10px"><span style="color:{MUTED};font-size:10.5px">'
+                    f'सारांश · Summary</span><br>'
+                    f'<span style="color:{WHITE};font-size:12.5px;line-height:1.55">'
+                    f'{_html.escape(_summary)}</span></div>'
+                    f'</div>', unsafe_allow_html=True)
+
+                # ── Forwarding letter — SDM → department official ──────────
+                st.markdown('<div class="sec-label" style="margin-top:14px">अग्रेषण पत्र · '
+                            'Forwarding Letter '
+                            f'<span style="font-weight:400;color:{MUTED}">(SDM → संबंधित विभाग)</span>'
+                            '</div>', unsafe_allow_html=True)
+                _lk = f"letter_{r.db_id}"
+                if st.button("✉ पत्र तैयार करें · Draft forwarding letter",
+                             key=f"draft_{r.db_id}", use_container_width=True):
+                    detail = db.load_case_detail(int(r.db_id))
+                    if not detail:
+                        st.session_state[_lk] = "— प्रकरण नहीं मिला · case not found —"
+                    else:
+                        _dcat    = detail.get("category", "Other / Anya")
+                        _meta    = SCHEMA.get(_dcat, SCHEMA["Other / Anya"])
+                        _office  = _meta["department"]
+                        _officer = (_meta.get("jurisdiction", "").split("➔")[0].strip() or _office)
+                        _drafted = None
+                        if _gk:
+                            _ct = init_gemini(_gk)
+                            if _ct[0] is not None:
+                                with st.spinner("Gemini is drafting the official letter…"):
+                                    _drafted = gemini_draft_letter(_ct, detail, _office, _officer)
+                        st.session_state[_lk] = _drafted or _template_letter(detail, _office, _officer)
+                    # no st.rerun() — the button's own rerun renders the letter below
+                    # in this same pass, keeping the expander open.
+
+                if st.session_state.get(_lk):
+                    if not _gk:
+                        st.markdown('<div class="sb-meta">बिना Gemini key — मानक टेम्पलेट पत्र · '
+                                    'No key: standard template letter (add a key for an AI-drafted '
+                                    'letter).</div>', unsafe_allow_html=True)
+                    _edited = st.text_area("Forwarding letter (editable)",
+                                           value=st.session_state[_lk], height=340,
+                                           key=f"lbox_{r.db_id}",
+                                           label_visibility="collapsed")
+                    st.session_state[_lk] = _edited
+                    _copy_button(_edited, key=str(r.db_id))
 
     st.markdown("</div>", unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════
-# PAGE 2 — ANALYTICS SUITE
+# PAGE 3 — ANALYTICS SUITE
 # ══════════════════════════════════════════════════════════════════════
 elif selected == "Analytics Suite":
 

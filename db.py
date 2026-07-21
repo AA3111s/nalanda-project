@@ -363,6 +363,7 @@ _LIST_COLS = (
     grievances.c.priority, grievances.c.status, grievances.c.source,
     grievances.c.is_demo, grievances.c.resolved_on,
     grievances.c.complainant_name, grievances.c.village, grievances.c.created_at,
+    grievances.c.summary,
 )
 
 
@@ -381,7 +382,7 @@ def load_grievances(include_demo: bool = True) -> pd.DataFrame:
     if df.empty:
         cols = ["ID", "Date", "Category", "Department", "Block", "Priority",
                 "Status", "Days_Open", "Source", "db_id", "is_demo",
-                "Applicant", "Village", "Registered"]
+                "Applicant", "Village", "Registered", "Summary"]
         return pd.DataFrame({c: pd.Series(dtype="object") for c in cols})
 
     df = _compute_days_open(df)
@@ -391,7 +392,7 @@ def load_grievances(include_demo: bool = True) -> pd.DataFrame:
         "department": "Department", "block": "Block", "priority": "Priority",
         "status": "Status", "source": "Source", "id": "db_id",
         "complainant_name": "Applicant", "village": "Village",
-        "created_at": "Registered",
+        "created_at": "Registered", "summary": "Summary",
     })
     df["Date"] = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d")
     # created_at is stored UTC; show the IST calendar date it was registered on.
@@ -399,6 +400,7 @@ def load_grievances(include_demo: bool = True) -> pd.DataFrame:
                         .dt.tz_convert("Asia/Kolkata").dt.strftime("%Y-%m-%d"))
     df["Applicant"] = df["Applicant"].fillna("—")
     df["Village"] = df["Village"].fillna("—")
+    df["Summary"] = df["Summary"].fillna("—")
     return df
 
 
