@@ -38,6 +38,7 @@ from sqlalchemy import (
     Index, Integer, MetaData, String, Table, Text, create_engine, func,
     insert, select, update,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import NullPool, QueuePool
 
 # ── vocabularies (mirrored by CHECK constraints below) ────────────────────
@@ -79,7 +80,15 @@ grievances = Table(
     Column("source", String(32), nullable=False, default="Manual"),
     # PII — see the retention note in the plan before exporting any of this.
     Column("complainant_name", String(120)),
+    # Guardian (S/o · D/o · W/o). relation is one of Father/Mother/"" — kept
+    # separate from the name so a letter can address "पिता श्री …" correctly.
+    Column("guardian_name", String(120)),
+    Column("guardian_relation", String(16)),
+    Column("contact_number", String(20)),
     Column("village", String(120)),
+    # Operator-editable routing chain; defaults to the category's SCHEMA chain
+    # but can be overridden per-case at capture time.
+    Column("jurisdiction", Text),
     Column("summary", Text),
     Column("transcription", Text),
     Column("confidence", Float),
@@ -284,10 +293,44 @@ def backend() -> str:
     return get_engine().dialect.name
 
 
+# Columns added after the table first shipped. metadata.create_all() only
+# creates absent *tables*, never absent *columns*, so an existing ngis.db or
+# Supabase table needs an explicit ADD COLUMN. Type given per dialect since
+# SQLite and Postgres spell them differently.
+_ADDED_COLUMNS = {
+    "guardian_name":     {"sqlite": "VARCHAR(120)", "postgresql": "VARCHAR(120)"},
+    "guardian_relation": {"sqlite": "VARCHAR(16)",  "postgresql": "VARCHAR(16)"},
+    "contact_number":    {"sqlite": "VARCHAR(20)",  "postgresql": "VARCHAR(20)"},
+    "jurisdiction":      {"sqlite": "TEXT",         "postgresql": "TEXT"},
+}
+
+
+def _ensure_columns(eng) -> None:
+    """Add any columns that post-date an existing grievances table.
+
+    ADD COLUMN is supported by both SQLite and Postgres and is a cheap
+    metadata-only change for a nullable column, so this is safe to run on
+    every process start.
+    """
+    from sqlalchemy import inspect as _inspect
+    dialect = eng.dialect.name  # 'sqlite' | 'postgresql'
+    existing = {c["name"] for c in _inspect(eng).get_columns("grievances")}
+    missing = [c for c in _ADDED_COLUMNS if c not in existing]
+    if not missing:
+        return
+    with eng.begin() as cx:
+        for col in missing:
+            coltype = _ADDED_COLUMNS[col].get(dialect, "TEXT")
+            cx.exec_driver_sql(
+                f"ALTER TABLE grievances ADD COLUMN {col} {coltype}")
+
+
 @st.cache_resource
 def init_schema() -> bool:
     """Create tables/indexes if absent. Idempotent; runs once per process."""
-    metadata.create_all(get_engine())
+    eng = get_engine()
+    metadata.create_all(eng)
+    _ensure_columns(eng)
     return True
 
 
@@ -364,6 +407,8 @@ _LIST_COLS = (
     grievances.c.is_demo, grievances.c.resolved_on,
     grievances.c.complainant_name, grievances.c.village, grievances.c.created_at,
     grievances.c.summary,
+    grievances.c.guardian_name, grievances.c.guardian_relation,
+    grievances.c.contact_number,
 )
 
 
@@ -382,7 +427,8 @@ def load_grievances(include_demo: bool = True) -> pd.DataFrame:
     if df.empty:
         cols = ["ID", "Date", "Category", "Department", "Block", "Priority",
                 "Status", "Days_Open", "Source", "db_id", "is_demo",
-                "Applicant", "Village", "Registered", "Summary"]
+                "Applicant", "Village", "Registered", "Summary",
+                "Guardian", "GuardianRelation", "Contact"]
         return pd.DataFrame({c: pd.Series(dtype="object") for c in cols})
 
     df = _compute_days_open(df)
@@ -393,6 +439,8 @@ def load_grievances(include_demo: bool = True) -> pd.DataFrame:
         "status": "Status", "source": "Source", "id": "db_id",
         "complainant_name": "Applicant", "village": "Village",
         "created_at": "Registered", "summary": "Summary",
+        "guardian_name": "Guardian", "guardian_relation": "GuardianRelation",
+        "contact_number": "Contact",
     })
     df["Date"] = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d")
     # created_at is stored UTC; show the IST calendar date it was registered on.
@@ -401,6 +449,9 @@ def load_grievances(include_demo: bool = True) -> pd.DataFrame:
     df["Applicant"] = df["Applicant"].fillna("—")
     df["Village"] = df["Village"].fillna("—")
     df["Summary"] = df["Summary"].fillna("—")
+    df["Guardian"] = df["Guardian"].fillna("—")
+    df["GuardianRelation"] = df["GuardianRelation"].fillna("")
+    df["Contact"] = df["Contact"].fillna("—")
     return df
 
 
@@ -418,6 +469,15 @@ def load_case_detail(grievance_db_id: int) -> dict:
     with get_engine().connect() as cx:
         row = cx.execute(stmt).mappings().first()
     return dict(row) if row else {}
+
+
+def case_db_id(case_no: str):
+    """Resolve a case number back to its primary key (None if not found)."""
+    if not case_no:
+        return None
+    stmt = select(grievances.c.id).where(grievances.c.case_no == str(case_no))
+    with get_engine().connect() as cx:
+        return cx.execute(stmt).scalar_one_or_none()
 
 
 def case_options(include_demo: bool = True, only_open: bool = True,
@@ -482,7 +542,11 @@ def insert_grievance(payload: dict, *, is_demo: bool = False) -> str:
         "status": normalise_status(payload.get("status") or payload.get("Status") or "Open"),
         "source": str(payload.get("source") or payload.get("Source") or "Manual"),
         "complainant_name": payload.get("complainant_name"),
+        "guardian_name": payload.get("guardian_name"),
+        "guardian_relation": payload.get("guardian_relation"),
+        "contact_number": payload.get("contact_number"),
         "village": payload.get("village"),
+        "jurisdiction": payload.get("jurisdiction"),
         "summary": payload.get("summary"),
         "transcription": payload.get("transcription"),
         "confidence": payload.get("confidence"),
@@ -494,18 +558,39 @@ def insert_grievance(payload: dict, *, is_demo: bool = False) -> str:
     if row["status"] == "Resolved":
         row["resolved_on"] = row["filed_on"]
 
+    # Serial number: NLD/<year>/<running>, the running number restarting at
+    # 0001 each calendar year (per the office's register convention). The year
+    # follows filed_on so the number matches the date printed on the ticket.
+    # The count is racy in theory, but case_no is UNIQUE, so a colliding
+    # concurrent writer trips the constraint and we simply recompute.
+    year = row["filed_on"].year
+    prefix = f"NLD/{year}/"
     eng = get_engine()
-    with eng.begin() as cx:
-        new_id = cx.execute(insert(grievances).values(**row)).inserted_primary_key[0]
-        case_no = f"NLD-{new_id:05d}"
-        cx.execute(update(grievances)
-                   .where(grievances.c.id == new_id)
-                   .values(case_no=case_no))
-        cx.execute(insert(status_history).values(
-            grievance_id=new_id, from_status=None, to_status=row["status"],
-            note="Case registered", changed_by=payload.get("changed_by", "operator"),
-            changed_at=datetime.utcnow(),
-        ))
+    for _attempt in range(5):
+        try:
+            with eng.begin() as cx:
+                new_id = cx.execute(
+                    insert(grievances).values(**row)).inserted_primary_key[0]
+                seq = cx.execute(
+                    select(func.count()).select_from(grievances)
+                    .where(grievances.c.is_demo.is_(False))
+                    .where(grievances.c.case_no.like(f"{prefix}%"))
+                ).scalar_one()  # excludes the row just inserted (case_no NULL)
+                case_no = f"{prefix}{seq + 1:04d}"
+                cx.execute(update(grievances)
+                           .where(grievances.c.id == new_id)
+                           .values(case_no=case_no))
+                cx.execute(insert(status_history).values(
+                    grievance_id=new_id, from_status=None, to_status=row["status"],
+                    note="Case registered",
+                    changed_by=payload.get("changed_by", "operator"),
+                    changed_at=datetime.utcnow(),
+                ))
+            break
+        except IntegrityError:
+            if _attempt == 4:
+                raise
+            continue  # another writer took this number; recompute and retry
 
     load_grievances.clear()
     return case_no

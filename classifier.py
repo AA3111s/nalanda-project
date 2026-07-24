@@ -1,6 +1,7 @@
 # classifier.py
 import re
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # Bilingual mapping for Block detection
 BLOCK_MAPPING = {
@@ -266,7 +267,7 @@ def _extract_date(text):
         m = re.search(p, text, re.IGNORECASE)
         if m:
             return m.group(0)
-    return datetime.now().strftime('%Y-%m-%d')
+    return datetime.now(ZoneInfo("Asia/Kolkata")).strftime('%Y-%m-%d')
 
 def get_all_categories():
     return list(SCHEMA.keys())
