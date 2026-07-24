@@ -40,6 +40,12 @@ def _resolved_gemini_key() -> str:
         key = ""  # no secrets.toml at all
     return (key or os.getenv("GEMINI_API_KEY") or "").strip()
 
+
+# User-facing label for the OCR/AI engine. The specific model is an internal
+# implementation detail (see _GEMINI_CHAIN) and is deliberately not surfaced —
+# the app presents it generically as choosing the best available model.
+MODEL_LABEL = "Using the best available model for the task…"
+
 # ══════════════════════════════════════════════════════════════════════
 # HEIC SUPPORT
 # ══════════════════════════════════════════════════════════════════════
@@ -256,9 +262,9 @@ def _gemini_generate(client_tuple, prompt, image_jpeg=None):
                 _s = str(_e); _last_err = _s
                 if _is_quota(_s): quota_hit = True; time.sleep(5); continue
                 if _is_retryable(_s): continue
-                return None, f"Fatal Gemini error: {_s}"
+                return None, f"Fatal model error: {_s}"
         if quota_hit:
-            return None, "🚫 Gemini free-tier quota exhausted.\n\nFix: Generate a new API key at https://aistudio.google.com/apikey\n\nLast error: " + str(_last_err)
+            return None, "🚫 Model free-tier quota exhausted.\n\nFix: Generate a new API key at https://aistudio.google.com/apikey\n\nLast error: " + str(_last_err)
         return None, f"All models exhausted. Last error: {_last_err}"
 
     import google.generativeai as _old_genai
@@ -280,7 +286,7 @@ def _gemini_generate(client_tuple, prompt, image_jpeg=None):
             _s = str(_e); _last_err = _s
             if _is_quota(_s): quota_hit = True; time.sleep(5); continue
             if _is_retryable(_s): continue
-            return None, f"Fatal Gemini error: {_s}"
+            return None, f"Fatal model error: {_s}"
     if quota_hit:
         return None, "🚫 Quota exhausted.\n\nGet new key: https://aistudio.google.com/apikey\n\nLast error: " + str(_last_err)
     return None, f"All models exhausted. Last: {_last_err}"
@@ -444,8 +450,11 @@ def _copy_button(text, key, label="📋 पत्र कॉपी करें �
     time = the current edited letter) using a hidden textarea + execCommand, which
     works inside Streamlit's component iframe where navigator.clipboard is often
     blocked. `key` keeps the component id unique when rendered inside a loop."""
-    payload   = json.dumps(text or "")
-    label_js  = json.dumps(label)
+    # json.dumps escapes quotes but NOT "</", so a literal </script> in the
+    # letter text would close this inline <script> early and inject markup.
+    # Neutralise the closing-tag sequence (valid JS, same string value).
+    payload   = json.dumps(text or "").replace("</", "<\\/")
+    label_js  = json.dumps(label).replace("</", "<\\/")
     btn_id    = f"cb_{key}"
     components.html(f"""
       <button id="{btn_id}" style="width:100%;padding:9px 14px;cursor:pointer;
@@ -500,7 +509,7 @@ def forwarding_letter_ui(db_id, gk, *, header=True):
             if gk:
                 _ct = init_gemini(gk)
                 if _ct[0] is not None:
-                    with st.spinner("Gemini is drafting the official letter…"):
+                    with st.spinner(MODEL_LABEL):
                         _drafted = gemini_draft_letter(_ct, detail, _office, _officer)
             st.session_state[_lk] = _drafted or _template_letter(detail, _office, _officer)
         # no st.rerun() — the button's own rerun renders the letter below
@@ -508,8 +517,8 @@ def forwarding_letter_ui(db_id, gk, *, header=True):
 
     if st.session_state.get(_lk):
         if not gk:
-            st.markdown('<div class="sb-meta">बिना Gemini key — मानक टेम्पलेट पत्र · '
-                        'No key: standard template letter (add a key for an AI-drafted '
+            st.markdown('<div class="sb-meta">बिना कुंजी — मानक टेम्पलेट पत्र · '
+                        'No key: standard template letter (configure a key for an AI-drafted '
                         'letter).</div>', unsafe_allow_html=True)
         _edited = st.text_area("Forwarding letter (editable)",
                                value=st.session_state[_lk], height=340,
@@ -1529,7 +1538,7 @@ with st.sidebar:
     st.markdown("<div class='sb-cap'>OCR इंजन · OCR Engine</div>", unsafe_allow_html=True)
     if _resolved_gemini_key():
         active_display = st.session_state.get("_gemini_active", _GEMINI_CHAIN[1])
-        st.markdown(f"<div class='sb-meta' style='color:#4F7C3A'>✓ Gemini सक्रिय · {active_display}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='sb-meta' style='color:#4F7C3A'>✓ OCR सक्रिय · {MODEL_LABEL}</div>", unsafe_allow_html=True)
     else:
         st.markdown("<div class='sb-meta' style='color:#93312B'>⚠ OCR निष्क्रिय — कुंजी सेट नहीं · key not configured</div>", unsafe_allow_html=True)
 
@@ -2112,7 +2121,7 @@ elif selected == "Field Capture":
     st.markdown('<div class="tricolor-strip"></div>', unsafe_allow_html=True)
     heritage_masthead()
     hero("Field Capture", "क्षेत्र संग्रह",
-         "Janata Darbar digitization terminal · Gemini OCR · auto-classification · digital register",
+         "Janata Darbar digitization terminal · AI OCR · auto-classification · digital register",
          "pawapuri", "Capture Terminal")
     st.markdown('<div class="ngis-body">', unsafe_allow_html=True)
 
@@ -2165,21 +2174,21 @@ elif selected == "Field Capture":
                 n_pages=len(page_images)
                 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
                 if not gemini_key_val:
-                    st.markdown('<div class="alert-high">⚠ Add Gemini API key in sidebar to enable OCR.\nGet free key: https://aistudio.google.com/apikey</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="alert-high">⚠ OCR unavailable — model API key is not configured. Set it server-side (secrets / env) to enable OCR.</div>', unsafe_allow_html=True)
                 else:
-                    btn_label=("🔍 पत्र पढ़ें · Process with Gemini OCR" if n_pages==1
-                               else f"🔍 {n_pages} पृष्ठ पढ़ें · Process {n_pages} pages with Gemini OCR")
+                    btn_label=("🔍 पत्र पढ़ें · Process with AI OCR" if n_pages==1
+                               else f"🔍 {n_pages} पृष्ठ पढ़ें · Process {n_pages} pages with AI OCR")
                     if st.button(btn_label, use_container_width=True):
                         client_tuple=init_gemini(gemini_key_val)
                         client,sdk_type=client_tuple
                         if client is None:
-                            st.markdown('<div class="alert-high">⚠ Failed to initialise Gemini.\nCheck API key: https://aistudio.google.com/apikey</div>', unsafe_allow_html=True)
+                            st.markdown('<div class="alert-high">⚠ Failed to initialise the model.\nCheck API key: https://aistudio.google.com/apikey</div>', unsafe_allow_html=True)
                         else:
                             # Stage 1 — OCR each page to plain text.
                             transcripts=[]; ocr_err=None
                             prog=st.progress(0.0)
                             for i,pb in enumerate(page_images):
-                                with st.spinner(f"Gemini ({active_model}) reading page {i+1} of {n_pages}…"):
+                                with st.spinner(f"{MODEL_LABEL} — reading page {i+1} of {n_pages}…"):
                                     res=run_gemini_ocr(client_tuple,pb)
                                 if "error" in res: ocr_err=res["error"]; break
                                 transcripts.append((res.get("transcription") or "").strip())
@@ -2192,7 +2201,7 @@ elif selected == "Field Capture":
                                 combined=(transcripts[0] if n_pages==1
                                           else "\n\n".join(f"--- पृष्ठ / Page {i+1} ---\n{t}" for i,t in enumerate(transcripts)))
                                 # Stage 2 — one extraction pass over the whole letter.
-                                with st.spinner("Gemini is extracting applicant, category & routing…"):
+                                with st.spinner(f"{MODEL_LABEL} — extracting applicant, category & routing…"):
                                     fields=gemini_extract_fields(client_tuple,combined)
                                 if "error" in fields:
                                     ferr=fields["error"]
@@ -2203,7 +2212,7 @@ elif selected == "Field Capture":
                                     st.session_state.ocr_result={
                                         "transcription":combined,
                                         "issue_summary":fields.get("issue_summary") or clf.get("issue_summary") or "",
-                                        "source":f"OCR / Gemini ({n_pages}p)" if n_pages>1 else "OCR / Gemini",
+                                        "source":f"OCR / AI ({n_pages}p)" if n_pages>1 else "OCR / AI",
                                         "complainant_name":clf.get("complainant_name","Unknown"),
                                         "village":clf.get("village","Unknown"),
                                         "block":clf.get("block","Unknown"),
@@ -2224,16 +2233,16 @@ elif selected == "Field Capture":
                         client_tuple=init_gemini(gemini_key_val)
                         client,_=client_tuple
                         if client is not None:
-                            with st.spinner(f"Gemini ({active_model}) is understanding the grievance…"):
+                            with st.spinner(f"{MODEL_LABEL} — understanding the grievance…"):
                                 fields=gemini_extract_fields(client_tuple,raw_text)
                             if "error" in fields:
-                                st.markdown(f'<div class="alert-warn">Gemini unavailable — using keyword classifier.\n{_html.escape(fields["error"])}</div>', unsafe_allow_html=True)
+                                st.markdown(f'<div class="alert-warn">Model unavailable — using keyword classifier.\n{_html.escape(fields["error"])}</div>', unsafe_allow_html=True)
                                 fields=None
                     clf=build_classification(raw_text,fields)
                     st.session_state.ocr_result={
                         "transcription":raw_text,
                         "issue_summary":(fields.get("issue_summary") if fields else "") or clf.get("issue_summary") or "Manual entry",
-                        "source":"Manual + Gemini" if fields else "Manual",
+                        "source":"Manual + AI" if fields else "Manual",
                         "complainant_name":clf.get("complainant_name","Unknown"),
                         "village":clf.get("village","Unknown"),
                         "block":clf.get("block","Unknown"),
@@ -2245,11 +2254,11 @@ elif selected == "Field Capture":
         heic_ok     = _HEIC_OK or _LIBHEIF_OK
         heic_status = "✓ HEIC · JPG · PNG · Camera" if heic_ok else "✗ HEIC unavail · JPG · PNG · Camera"
         heic_color  = GREEN if heic_ok else RED
-        key_status  = f"✓ Key set ({active_model})" if gemini_key_val else "✗ No key — configure server-side"
+        key_status  = "✓ Key set · best available model" if gemini_key_val else "✗ No key — configure server-side"
         key_color   = GREEN if gemini_key_val else RED
         st.markdown(f"""
         <div class="processing-note">
-          OCR ENGINE  · Google Gemini (auto-fallback chain)<br>
+          OCR ENGINE  · Best available model (auto-fallback chain)<br>
           <span style="color:{heic_color}">FORMATS     · {heic_status}</span><br>
           <span style="color:{key_color}">API KEY     · {key_status}</span><br>
           LANGUAGES   · Hindi Devanagari + English<br>
@@ -2415,7 +2424,7 @@ elif selected == "Field Capture":
                         "block":             f_block or "Unknown",
                         "priority":          f_priority,
                         "status":            "Open",
-                        "source":            ocr.get("source", "OCR / Gemini"),
+                        "source":            ocr.get("source", "OCR / AI"),
                         "complainant_name":  f_name.strip(),
                         "guardian_name":     f_guardian.strip() or None,
                         "guardian_relation": _rel_store.get(f_guardian_rel) or None,
