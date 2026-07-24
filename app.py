@@ -6,7 +6,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
+import os
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from PIL import Image
 import json
 import io
@@ -14,6 +16,29 @@ import time
 import warnings
 import html as _html  # ← for safe escaping of dynamic values into HTML
 from splash import render_splash, corner_svg_static, fish_svg_static
+
+# Every reader of this register sits in one district of Bihar. datetime.now()
+# is the host machine's local clock (arbitrary on a cloud host), so all
+# operator-facing timestamps go through IST explicitly. India has no DST.
+_IST = ZoneInfo("Asia/Kolkata")
+
+
+def now_ist() -> datetime:
+    """Current wall-clock time in IST, for display."""
+    return datetime.now(_IST)
+
+
+def _resolved_gemini_key() -> str:
+    """Gemini API key, supplied server-side — never entered in the UI.
+
+    Order: Streamlit secrets [gemini].api_key, then the GEMINI_API_KEY env var.
+    Returns "" when unset, which cleanly disables OCR.
+    """
+    try:
+        key = (st.secrets.get("gemini", {}) or {}).get("api_key", "")
+    except Exception:
+        key = ""  # no secrets.toml at all
+    return (key or os.getenv("GEMINI_API_KEY") or "").strip()
 
 # ══════════════════════════════════════════════════════════════════════
 # HEIC SUPPORT
@@ -337,9 +362,14 @@ def build_classification(combined_text, gemini_fields=None):
 # ══════════════════════════════════════════════════════════════════════
 def _letter_fields(detail):
     """Pull the fields a forwarding letter needs from a load_case_detail row."""
+    _rel = str(detail.get("guardian_relation") or "").strip()
+    _gname = str(detail.get("guardian_name") or "").strip()
+    guardian = f"{_rel}: {_gname}" if (_rel and _gname) else (_gname or "")
     return {
         "case_no": str(detail.get("case_no") or "—"),
         "name":    str(detail.get("complainant_name") or "अज्ञात / Unknown"),
+        "guardian": guardian,
+        "contact": str(detail.get("contact_number") or "").strip(),
         "village": str(detail.get("village") or "—"),
         "block":   str(detail.get("block") or "—"),
         "category": str(detail.get("category") or "Other / Anya"),
@@ -352,7 +382,9 @@ def _letter_fields(detail):
 def _template_letter(detail, office, officer):
     """Offline formal forwarding letter — works with no Gemini key / on failure."""
     f = _letter_fields(detail)
-    today = datetime.now().strftime("%d/%m/%Y")
+    today = now_ist().strftime("%d/%m/%Y")
+    _guardian_line = f"    {f['guardian']}\n" if f['guardian'] else ""
+    _contact_line = f"    संपर्क / Contact: {f['contact']}\n" if f['contact'] else ""
     return f"""अनुमंडल कार्यालय, हिलसा (नालंदा) — बिहार सरकार
 Office of the Sub-Divisional Magistrate, Hilsa (Nalanda) — Government of Bihar
 
@@ -370,7 +402,7 @@ Office of the Sub-Divisional Magistrate, Hilsa (Nalanda) — Government of Bihar
     उपर्युक्त विषय के संबंध में श्री/श्रीमती {f['name']} (ग्राम {f['village']}, प्रखंड
 {f['block']}) द्वारा दिनांक {f['filed_on']} को दर्ज शिकायत आपके कार्यालय को
 आवश्यक कार्रवाई हेतु अग्रेषित की जाती है।
-
+{_guardian_line}{_contact_line}
 शिकायत का सारांश / Summary of grievance:
     {f['summary']}
 
@@ -395,7 +427,7 @@ Draft a formal government FORWARDING LETTER from the SDM to the department offic
 Write it BILINGUAL — each section in Hindi (Devanagari) followed by its English equivalent. Use the standard Indian government letter format: office header, Ref/Date, To (officer + office), Subject, salutation, body of 2-3 short paragraphs (including the grievance summary), a request for time-bound action and a report back, and a "Yours faithfully / SDM, Hilsa" close. Do NOT invent facts beyond those given. Return ONLY the letter text — no markdown, no backticks, no commentary.
 
 Case no: {f['case_no']}
-Complainant: {f['name']}
+Complainant: {f['name']}{(chr(10) + "Guardian: " + f['guardian']) if f['guardian'] else ""}{(chr(10) + "Contact: " + f['contact']) if f['contact'] else ""}
 Village / Block: {f['village']} / {f['block']}
 Category: {f['category']}
 Date filed: {f['filed_on']}
@@ -438,6 +470,53 @@ def _copy_button(text, key, label="📋 पत्र कॉपी करें �
         }})();
       </script>
     """, height=48)
+
+
+def forwarding_letter_ui(db_id, gk, *, header=True):
+    """Draft → edit → copy a forwarding letter for one saved case.
+
+    Shared by the Complaints register and the Field-Capture page so there is a
+    single letter code path. The addressee is taken from the case's own
+    (operator-edited) jurisdiction chain when present, else the category default.
+    """
+    if header:
+        st.markdown('<div class="sec-label" style="margin-top:14px">अग्रेषण पत्र · '
+                    'Forwarding Letter '
+                    f'<span style="font-weight:400;color:{MUTED}">(SDM → संबंधित विभाग)</span>'
+                    '</div>', unsafe_allow_html=True)
+    _lk = f"letter_{db_id}"
+    if st.button("✉ पत्र तैयार करें · Draft forwarding letter",
+                 key=f"draft_{db_id}", use_container_width=True):
+        detail = db.load_case_detail(int(db_id))
+        if not detail:
+            st.session_state[_lk] = "— प्रकरण नहीं मिला · case not found —"
+        else:
+            _dcat    = detail.get("category", "Other / Anya")
+            _meta    = SCHEMA.get(_dcat, SCHEMA["Other / Anya"])
+            _office  = _meta["department"]
+            _chain   = (detail.get("jurisdiction") or _meta.get("jurisdiction", "") or "")
+            _officer = (_chain.split("➔")[0].strip() if _chain else "") or _office
+            _drafted = None
+            if gk:
+                _ct = init_gemini(gk)
+                if _ct[0] is not None:
+                    with st.spinner("Gemini is drafting the official letter…"):
+                        _drafted = gemini_draft_letter(_ct, detail, _office, _officer)
+            st.session_state[_lk] = _drafted or _template_letter(detail, _office, _officer)
+        # no st.rerun() — the button's own rerun renders the letter below
+        # in this same pass, keeping the expander open.
+
+    if st.session_state.get(_lk):
+        if not gk:
+            st.markdown('<div class="sb-meta">बिना Gemini key — मानक टेम्पलेट पत्र · '
+                        'No key: standard template letter (add a key for an AI-drafted '
+                        'letter).</div>', unsafe_allow_html=True)
+        _edited = st.text_area("Forwarding letter (editable)",
+                               value=st.session_state[_lk], height=340,
+                               key=f"lbox_{db_id}",
+                               label_visibility="collapsed")
+        st.session_state[_lk] = _edited
+        _copy_button(_edited, key=str(db_id))
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1308,7 +1387,7 @@ def heritage_masthead():
         </div>
       </div>
       <div class="mast-r">
-        <span class="mast-live"><i></i> LIVE · {datetime.now().strftime('%H:%M')} IST</span><br>
+        <span class="mast-live"><i></i> LIVE · {now_ist().strftime('%H:%M')} IST</span><br>
         हिलसा अनुमंडल · <b>EST. 427 CE</b>
       </div>
     </div>""", unsafe_allow_html=True)
@@ -1372,10 +1451,9 @@ except db.ConfigError as _cfg:
     </div>""", unsafe_allow_html=True)
     st.stop()
 
-for _k in ("ocr_result","classify_result","_gemini_active","gemini_key"):
+for _k in ("ocr_result","classify_result","_gemini_active"):
     if _k not in st.session_state:
         st.session_state[_k] = None if _k != "_gemini_active" else _GEMINI_CHAIN[1]
-        if _k == "gemini_key": st.session_state[_k] = ""
 
 show_demo = st.session_state.get("include_demo", True)
 df        = db.load_grievances(include_demo=show_demo)
@@ -1446,24 +1524,27 @@ with st.sidebar:
 
     st.markdown("<div class='sb-div'></div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='sb-cap'>Gemini API Key</div>", unsafe_allow_html=True)
-    raw_key = st.text_input("Gemini API Key", type="password", placeholder="AIza…",
-                             value=st.session_state.get("gemini_key",""), label_visibility="collapsed")
-    if raw_key and raw_key.strip():
-        st.session_state["gemini_key"] = raw_key.strip()
+    # The Gemini key is supplied server-side (secrets / env), never pasted in
+    # the UI. Show only whether OCR is available — never the key itself.
+    st.markdown("<div class='sb-cap'>OCR इंजन · OCR Engine</div>", unsafe_allow_html=True)
+    if _resolved_gemini_key():
         active_display = st.session_state.get("_gemini_active", _GEMINI_CHAIN[1])
-        st.markdown(f"<div class='sb-meta' style='color:#4F7C3A'>✓ Key set · {active_display}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='sb-meta' style='color:#4F7C3A'>✓ Gemini सक्रिय · {active_display}</div>", unsafe_allow_html=True)
     else:
-        st.session_state["gemini_key"] = ""
-        st.markdown("<div class='sb-meta' style='color:#93312B'>⚠ No key — OCR disabled</div>", unsafe_allow_html=True)
-        st.markdown("<div class='sb-meta'>aistudio.google.com/apikey</div>", unsafe_allow_html=True)
+        st.markdown("<div class='sb-meta' style='color:#93312B'>⚠ OCR निष्क्रिय — कुंजी सेट नहीं · key not configured</div>", unsafe_allow_html=True)
 
     st.markdown("<div class='sb-div'></div>", unsafe_allow_html=True)
 
     st.markdown("<div class='sb-cap'>फ़िल्टर · Filters</div>", unsafe_allow_html=True)
     gp = st.selectbox("Priority", ["All","High","Medium","Low"], label_visibility="collapsed")
     gb = st.selectbox("Block", ["All"]+sorted(df["Block"].unique().tolist()), label_visibility="collapsed")
-    gname = st.text_input("Search applicant", placeholder="🔍 आवेदक खोजें · Search applicant name",
+    gcat = st.selectbox("Category", ["All"]+get_all_categories(),
+                        format_func=lambda c: c if c == "All" else c.split("/")[0].strip(),
+                        label_visibility="collapsed")
+    gstatus = st.selectbox("Status", ["All","Open","In Progress","Resolved"], label_visibility="collapsed")
+    gdates = st.date_input("दर्ज दिनांक · Date filed range", value=(),
+                           format="YYYY-MM-DD", label_visibility="collapsed")
+    gname = st.text_input("Search applicant", placeholder="🔍 नाम · केस सं. · संपर्क खोजें · name / case-no / contact",
                           label_visibility="collapsed")
 
     # Demo rows are real table rows flagged is_demo; untick to read true
@@ -1478,7 +1559,7 @@ with st.sidebar:
         f"<div class='sb-meta'>DB · <b>{db.backend()}</b><br>"
         f"वास्तविक प्रकरण · <b>{_real_n}</b></div>",
         unsafe_allow_html=True)
-    now = datetime.now()
+    now = now_ist()
     st.markdown(f"<div class='sb-meta'>{now.strftime('%d %b %Y · %H:%M')}<br>जनसंख्या <b>1,97,309</b><br>क्षेत्र <b>140 km²</b><br>ग्राम <b>56</b> · प्रखंड <b>20</b></div>", unsafe_allow_html=True)
 
     # Madhubani fish watermark — the splash motif, resting under the nav
@@ -1488,8 +1569,21 @@ with st.sidebar:
 fdf = df.copy()
 if gp != "All": fdf = fdf[fdf["Priority"]==gp]
 if gb != "All": fdf = fdf[fdf["Block"]==gb]
-if gname.strip() and "Applicant" in fdf.columns:
-    fdf = fdf[fdf["Applicant"].astype(str).str.contains(gname.strip(), case=False, na=False, regex=False)]
+if gcat != "All" and "Category" in fdf.columns: fdf = fdf[fdf["Category"]==gcat]
+if gstatus != "All" and "Status" in fdf.columns: fdf = fdf[fdf["Status"]==gstatus]
+# Date range filters on the letter's filed date (Date column, ISO strings).
+if isinstance(gdates, (tuple, list)) and len(gdates) == 2 and "Date" in fdf.columns:
+    _d = pd.to_datetime(fdf["Date"], errors="coerce").dt.date
+    fdf = fdf[(_d >= gdates[0]) & (_d <= gdates[1])]
+# One search box across applicant name, case number and contact.
+if gname.strip():
+    _q = gname.strip()
+    _cols = [c for c in ("Applicant", "ID", "Contact") if c in fdf.columns]
+    if _cols:
+        _mask = pd.Series(False, index=fdf.index)
+        for _c in _cols:
+            _mask |= fdf[_c].astype(str).str.contains(_q, case=False, na=False, regex=False)
+        fdf = fdf[_mask]
 
 # ── NAV VEIL — page-transition loader (presentation only) ─────────────
 # The single sanctioned session_state addition of the re-theme: remember
@@ -1529,12 +1623,12 @@ if selected == "Today's Brief":
     st.markdown('<div class="tricolor-strip"></div>', unsafe_allow_html=True)
     heritage_masthead()
     hero("Today's Brief", "आज का विवरण",
-         f'Live grievance status · Nalanda District · {datetime.now().strftime("%d %B %Y, %A")}',
+         f'Live grievance status · Nalanda District · {now_ist().strftime("%d %B %Y, %A")}',
          "nalanda_ruins", "Situation Report")
 
     st.markdown('<div class="ngis-body">', unsafe_allow_html=True)
 
-    today_str   = datetime.now().strftime("%Y-%m-%d")
+    today_str   = now_ist().strftime("%Y-%m-%d")
     today_n     = len(df[df["Date"]==today_str])
     high_n      = len(df[df["Priority"]=="High"])
     pending_n   = len(df[df["Status"]=="Open"])
@@ -1754,7 +1848,7 @@ elif selected == "Complaints":
         st.markdown("<div class='good-block'>कोई शिकायत नहीं · No complaints match the "
                     "current filters.</div>", unsafe_allow_html=True)
     else:
-        _gk = st.session_state.get("gemini_key", "")
+        _gk = _resolved_gemini_key()
         for r in reg.itertuples():
             _cat_short  = str(r.Category).split("/")[0].strip()
             _status_col = (RED if r.Status == "Open"
@@ -1798,42 +1892,7 @@ elif selected == "Complaints":
                     f'</div>', unsafe_allow_html=True)
 
                 # ── Forwarding letter — SDM → department official ──────────
-                st.markdown('<div class="sec-label" style="margin-top:14px">अग्रेषण पत्र · '
-                            'Forwarding Letter '
-                            f'<span style="font-weight:400;color:{MUTED}">(SDM → संबंधित विभाग)</span>'
-                            '</div>', unsafe_allow_html=True)
-                _lk = f"letter_{r.db_id}"
-                if st.button("✉ पत्र तैयार करें · Draft forwarding letter",
-                             key=f"draft_{r.db_id}", use_container_width=True):
-                    detail = db.load_case_detail(int(r.db_id))
-                    if not detail:
-                        st.session_state[_lk] = "— प्रकरण नहीं मिला · case not found —"
-                    else:
-                        _dcat    = detail.get("category", "Other / Anya")
-                        _meta    = SCHEMA.get(_dcat, SCHEMA["Other / Anya"])
-                        _office  = _meta["department"]
-                        _officer = (_meta.get("jurisdiction", "").split("➔")[0].strip() or _office)
-                        _drafted = None
-                        if _gk:
-                            _ct = init_gemini(_gk)
-                            if _ct[0] is not None:
-                                with st.spinner("Gemini is drafting the official letter…"):
-                                    _drafted = gemini_draft_letter(_ct, detail, _office, _officer)
-                        st.session_state[_lk] = _drafted or _template_letter(detail, _office, _officer)
-                    # no st.rerun() — the button's own rerun renders the letter below
-                    # in this same pass, keeping the expander open.
-
-                if st.session_state.get(_lk):
-                    if not _gk:
-                        st.markdown('<div class="sb-meta">बिना Gemini key — मानक टेम्पलेट पत्र · '
-                                    'No key: standard template letter (add a key for an AI-drafted '
-                                    'letter).</div>', unsafe_allow_html=True)
-                    _edited = st.text_area("Forwarding letter (editable)",
-                                           value=st.session_state[_lk], height=340,
-                                           key=f"lbox_{r.db_id}",
-                                           label_visibility="collapsed")
-                    st.session_state[_lk] = _edited
-                    _copy_button(_edited, key=str(r.db_id))
+                forwarding_letter_ui(r.db_id, _gk)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -2062,7 +2121,7 @@ elif selected == "Field Capture":
     st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
 
     left, right = st.columns([1,1.5], gap="large")
-    gemini_key_val = st.session_state.get("gemini_key","")
+    gemini_key_val = _resolved_gemini_key()
     active_model   = st.session_state.get("_gemini_active", _GEMINI_CHAIN[1])
 
     with left:
@@ -2186,7 +2245,7 @@ elif selected == "Field Capture":
         heic_ok     = _HEIC_OK or _LIBHEIF_OK
         heic_status = "✓ HEIC · JPG · PNG · Camera" if heic_ok else "✗ HEIC unavail · JPG · PNG · Camera"
         heic_color  = GREEN if heic_ok else RED
-        key_status  = f"✓ Key set ({active_model})" if gemini_key_val else "✗ No key — set in sidebar"
+        key_status  = f"✓ Key set ({active_model})" if gemini_key_val else "✗ No key — configure server-side"
         key_color   = GREEN if gemini_key_val else RED
         st.markdown(f"""
         <div class="processing-note">
@@ -2208,7 +2267,7 @@ elif selected == "Field Capture":
             # transaction, so it cannot be known (or guessed from a row count)
             # before saving. Show a placeholder until it exists.
             new_id   = "— on save —"
-            reg_date = datetime.now().strftime("%d/%m/%Y")
+            reg_date = now_ist().strftime("%d/%m/%Y")
 
             # Values still baked into read-only HTML (header + routing panel).
             e_id      = _html.escape(new_id)
@@ -2284,8 +2343,30 @@ elif selected == "Field Capture":
             cur_pri  = db.normalise_priority(clf.get("priority", "Medium"))
             if cur_pri not in pri_opts: cur_pri = "Medium"
 
+            # ── Live duplicate flag (from the detected values, before any edit) ──
+            # "Flagged when entered" — the operator sees a match the moment a
+            # letter is classified, with no checkbox to tick. It never blocks:
+            # the re-check at Save (below) uses the possibly-edited values.
+            _live_name = str(clf.get("complainant_name", "") or "").strip()
+            if _live_name and _live_name.lower() != "unknown":
+                _live_dups = db.find_duplicates(_live_name, cur_cat, cur_block)
+                if _live_dups:
+                    _lrows = "".join(
+                        f'<li><b>{_html.escape(str(d["case_no"]))}</b> · '
+                        f'{_html.escape(str(d["block"]))} · {_html.escape(str(d["status"]))} · '
+                        f'{_html.escape(str(d["filed_on"]))}</li>' for d in _live_dups)
+                    st.markdown(
+                        '<div class="alert-warn">⚠ संभावित डुप्लिकेट · Possible duplicate — '
+                        f'<b>{_html.escape(_live_name)}</b> already has {len(_live_dups)} open '
+                        f'case(s) in <b>{_html.escape(cur_cat.split("/")[0].strip())}</b> · '
+                        f'<b>{_html.escape(cur_block)}</b>:'
+                        f'<ul style="margin:6px 0 0 18px">{_lrows}</ul></div>',
+                        unsafe_allow_html=True)
+
             # A Streamlit form batches every edit and only fires on submit, so
             # editing one field never triggers a rerun that wipes the others.
+            _rel_opts = ["— कोई नहीं / none —", "पिता · Father", "माता · Mother"]
+            _rel_store = {"पिता · Father": "Father", "माता · Mother": "Mother"}
             with st.form("register_form", clear_on_submit=False):
                 fc1, fc2 = st.columns(2)
                 with fc1:
@@ -2296,11 +2377,23 @@ elif selected == "Field Capture":
                     f_date     = st.text_input("दिनांक · Date filed", value=str(clf.get("date_filed", "") or ""))
                     f_block    = st.selectbox("प्रखंड · Block", block_opts, index=block_opts.index(cur_block))
                     f_priority = st.selectbox("प्राथमिकता · Priority", pri_opts, index=pri_opts.index(cur_pri))
+                # Guardian (optional) — relation dropdown + name.
+                gc1, gc2 = st.columns(2)
+                with gc1:
+                    f_guardian_rel = st.selectbox("पिता/माता का नाम · Father's / Mother's name (optional)", _rel_opts)
+                with gc2:
+                    f_guardian     = st.text_input("अभिभावक का नाम · Guardian name", value="", placeholder="वैकल्पिक · optional")
+                # Contact (optional) + editable jurisdiction/routing chain.
+                cc1, cc2 = st.columns(2)
+                with cc1:
+                    f_contact      = st.text_input("संपर्क नंबर · Contact number", value="", placeholder="वैकल्पिक · optional")
+                with cc2:
+                    f_jurisdiction = st.text_input("न्यायाधिकार क्षेत्र · Jurisdiction chain (editable)",
+                                                   value=str(clf.get("jurisdiction", "") or ""))
                 f_subject = st.text_input("विषय · Subject / summary", value=str(ocr.get("issue_summary", "") or ""))
                 f_text    = st.text_area("पूर्ण पाठ · Full grievance text (editable)",
                                          value=str(ocr.get("transcription", "") or ""), height=180)
                 st.caption(f"प्रेषित विभाग · Department is set automatically from the category → {_html.escape(SCHEMA[cur_cat]['department'])}")
-                f_confirm_dup = st.checkbox("पुष्टि करें: यह डुप्लिकेट नहीं है · Confirm this is NOT a duplicate (tick only if a match is flagged)")
                 submitted = st.form_submit_button("✅ रजिस्टर में सहेजें · Save to Register", use_container_width=True)
 
             if submitted:
@@ -2308,44 +2401,44 @@ elif selected == "Field Capture":
                     st.markdown('<div class="alert-high">⚠ आवेदक का नाम आवश्यक है · Applicant name is required before saving.</div>', unsafe_allow_html=True)
                 elif f_category not in SCHEMA:
                     st.markdown('<div class="alert-high">⚠ मान्य श्रेणी चुनें · Choose a valid category.</div>', unsafe_allow_html=True)
-                elif (dups := db.find_duplicates(f_name.strip(), f_category, f_block)) and not f_confirm_dup:
-                    # Same applicant + same category (+ block) already has an open
-                    # case. Warn and hold the save until the operator confirms.
-                    dup_rows = "".join(
-                        f'<li><b>{_html.escape(str(d["case_no"]))}</b> · '
-                        f'{_html.escape(str(d["category"]).split("/")[0].strip())} · '
-                        f'{_html.escape(str(d["block"]))} · {_html.escape(str(d["status"]))} · '
-                        f'{_html.escape(str(d["filed_on"]))}</li>'
-                        for d in dups)
-                    st.markdown(
-                        '<div class="alert-warn">⚠ संभावित डुप्लिकेट · Possible duplicate — this applicant '
-                        f'already has {len(dups)} open case(s) in this category:<ul style="margin:6px 0 0 18px">{dup_rows}</ul>'
-                        '<div style="margin-top:6px">यदि यह वास्तव में नई शिकायत है तो ऊपर "Confirm this is NOT a duplicate" '
-                        'पर टिक करें और पुनः सहेजें · If this really is a new grievance, tick the confirm box above and Save again.</div></div>',
-                        unsafe_allow_html=True)
                 else:
+                    # Re-check duplicates against the (possibly edited) values.
+                    # This no longer blocks — it annotates the confirmation so the
+                    # record is kept and the operator is still warned.
+                    dups = db.find_duplicates(f_name.strip(), f_category, f_block)
                     # Department follows the (possibly edited) category; db owns
                     # date parsing, priority normalisation and case-no assignment.
                     saved_id = db.insert_grievance({
-                        "date_filed":       f_date.strip() or None,
-                        "category":         f_category,
-                        "department":       SCHEMA[f_category]["department"],
-                        "block":            f_block or "Unknown",
-                        "priority":         f_priority,
-                        "status":           "Open",
-                        "source":           ocr.get("source", "OCR / Gemini"),
-                        "complainant_name": f_name.strip(),
-                        "village":          f_village.strip() or None,
-                        "summary":          f_subject.strip() or None,
-                        "transcription":    f_text.strip() or None,
-                        "confidence":       clf.get("confidence"),
+                        "date_filed":        f_date.strip() or None,
+                        "category":          f_category,
+                        "department":        SCHEMA[f_category]["department"],
+                        "block":             f_block or "Unknown",
+                        "priority":          f_priority,
+                        "status":            "Open",
+                        "source":            ocr.get("source", "OCR / Gemini"),
+                        "complainant_name":  f_name.strip(),
+                        "guardian_name":     f_guardian.strip() or None,
+                        "guardian_relation": _rel_store.get(f_guardian_rel) or None,
+                        "contact_number":    f_contact.strip() or None,
+                        "village":           f_village.strip() or None,
+                        "jurisdiction":      f_jurisdiction.strip() or None,
+                        "summary":           f_subject.strip() or None,
+                        "transcription":     f_text.strip() or None,
+                        "confidence":        clf.get("confidence"),
                     })
                     st.session_state.ocr_result=None; st.session_state.classify_result=None
+                    # Remember the new case so its forwarding letter can be drafted
+                    # right here on rerun (see the placeholder panel below).
+                    st.session_state["_last_saved_id"] = db.case_db_id(saved_id)
+                    _dup_note = ""
+                    if dups:
+                        _dup_note = (" ⚠ संभावित डुप्लिकेट · possible duplicate of "
+                                     + ", ".join(str(d["case_no"]) for d in dups))
                     # st.rerun() destroys anything rendered before it, so the
                     # confirmation is stashed and drawn on the way back in —
                     # otherwise the operator never sees their case number.
                     st.session_state["_flash"] = (
-                        f"✅ {saved_id} — रजिस्टर में सहेजा गया। Today's Brief में देखें।")
+                        f"✅ {saved_id} — रजिस्टर में सहेजा गया। Today's Brief में देखें।{_dup_note}")
                     st.rerun()
 
             # ── Read-only routing reference (reflects the detected category;
@@ -2372,14 +2465,30 @@ elif selected == "Field Capture":
             st.markdown(f'<div class="{esc_cls}">{_html.escape(esc_msg)}</div>', unsafe_allow_html=True)
 
         else:
-            st.markdown("""
-            <div class="brief-card" style="text-align:center;padding:72px 20px;border-left:1px solid rgba(51,33,15,.16)">
-              <div style="font-size:44px;margin-bottom:14px;opacity:.5">📋</div>
-              <div class="dv" style="font-size:17px;font-weight:600;color:#33210F;margin-bottom:8px">
-                जनता दरबार शिकायत पत्रावली
-              </div>
-              <div style="font-size:12px;color:rgba(51,33,15,.58)">Upload a HEIC/JPG/PNG letter image or paste text on the left</div>
-            </div>""", unsafe_allow_html=True)
+            # After a save, offer the forwarding letter for the just-registered
+            # case right here — no need to switch to the Complaints page.
+            _lsid = st.session_state.get("_last_saved_id")
+            if _lsid:
+                _ldetail = db.load_case_detail(int(_lsid))
+                _lcase = str(_ldetail.get("case_no") or "—")
+                st.markdown(
+                    f'<div class="sec-label">अभी सहेजा गया · Just registered '
+                    f'<span style="font-weight:400;color:{MUTED}">— {_html.escape(_lcase)}</span></div>',
+                    unsafe_allow_html=True)
+                forwarding_letter_ui(int(_lsid), _resolved_gemini_key(), header=True)
+                if st.button("↺ नया प्रकरण · Start a new entry", key="clear_last_saved",
+                             use_container_width=True):
+                    st.session_state.pop("_last_saved_id", None)
+                    st.rerun()
+            else:
+                st.markdown("""
+                <div class="brief-card" style="text-align:center;padding:72px 20px;border-left:1px solid rgba(51,33,15,.16)">
+                  <div style="font-size:44px;margin-bottom:14px;opacity:.5">📋</div>
+                  <div class="dv" style="font-size:17px;font-weight:600;color:#33210F;margin-bottom:8px">
+                    जनता दरबार शिकायत पत्रावली
+                  </div>
+                  <div style="font-size:12px;color:rgba(51,33,15,.58)">Upload a HEIC/JPG/PNG letter image or paste text on the left</div>
+                </div>""", unsafe_allow_html=True)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
