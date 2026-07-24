@@ -2136,7 +2136,7 @@ elif selected == "Field Capture":
     with left:
         if input_mode == "📷  Scan Letter (Image)":
             st.markdown('<div class="sec-label">दस्तावेज़ अपलोड करें · Upload Document</div>', unsafe_allow_html=True)
-            upload_option=st.radio("",["📁  Upload file(s)","📷  Camera"],horizontal=True,label_visibility="collapsed")
+            upload_option=st.radio("अपलोड विधि · Upload method",["📁  Upload file(s)","📷  Camera"],horizontal=True,label_visibility="collapsed")
             page_images=[]            # ordered list of JPEG page-bytes; a multi-page letter = one grievance
             heic_ok = _HEIC_OK or _LIBHEIF_OK
 
@@ -2147,7 +2147,7 @@ elif selected == "Field Capture":
                 else:
                     allowed_types=["jpg","jpeg","png","heic","heif"]
                 st.markdown('<div class="sb-meta">एक से अधिक पृष्ठ चुनें · Upload every page of a multi-page complaint</div>', unsafe_allow_html=True)
-                uploaded=st.file_uploader("",type=allowed_types,label_visibility="collapsed",accept_multiple_files=True)
+                uploaded=st.file_uploader("शिकायत दस्तावेज़ · Grievance document",type=allowed_types,label_visibility="collapsed",accept_multiple_files=True)
                 if uploaded:
                     for uf in uploaded:
                         raw=uf.read()
@@ -2223,7 +2223,7 @@ elif selected == "Field Capture":
         else:
             st.markdown('<div class="sec-label">शिकायत पाठ दर्ज करें · Input Grievance Text</div>', unsafe_allow_html=True)
             st.markdown('<div class="sb-meta">Hindi · English · Hinglish — जैसे "humare gaon me handpump kharab hai"</div>', unsafe_allow_html=True)
-            raw_text=st.text_area("",height=220,placeholder="हमारे गाँव में पानी की सप्लाई बंद है… / humare gaon me pani nahi aa raha",label_visibility="collapsed")
+            raw_text=st.text_area("शिकायत पाठ · Grievance text",height=220,placeholder="हमारे गाँव में पानी की सप्लाई बंद है… / humare gaon me pani nahi aa raha",label_visibility="collapsed")
             if st.button("वर्गीकृत करें · Classify & Route →", use_container_width=True):
                 if raw_text.strip():
                     # Prefer Gemini (Hinglish + smart category) when a key is set;
