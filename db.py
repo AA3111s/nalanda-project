@@ -325,12 +325,43 @@ def _ensure_columns(eng) -> None:
                 f"ALTER TABLE grievances ADD COLUMN {col} {coltype}")
 
 
+# Tables reachable through Supabase's public PostgREST API. Without RLS, the
+# anon/authenticated API roles can read and write every row — and these hold
+# citizen PII (name, contact, guardian). This app never uses those roles: it
+# connects as the table owner over the pooler, which BYPASSES RLS, so enabling
+# RLS with no policies is a deny-all for the public API while leaving the app
+# untouched. Closes the Supabase advisor's "RLS Disabled in Public" criticals.
+_RLS_TABLES = ("grievances", "status_history")
+
+
+def _enforce_rls(eng) -> None:
+    """Enable row-level security on the public tables (Postgres only).
+
+    SQLite has no concept of RLS, so this is a no-op there. `ENABLE ROW LEVEL
+    SECURITY` is idempotent — re-running when it is already on does nothing.
+    """
+    if eng.dialect.name != "postgresql":
+        return
+    try:
+        with eng.begin() as cx:
+            for tbl in _RLS_TABLES:
+                # Identifiers are hardcoded constants, never user input.
+                cx.exec_driver_sql(
+                    f"ALTER TABLE public.{tbl} ENABLE ROW LEVEL SECURITY")
+    except Exception:
+        # A least-privilege connection role may lack ALTER on the table; never
+        # let a hardening step take the whole app down. The advisor will still
+        # flag it, which is the correct signal to fix the grant.
+        pass
+
+
 @st.cache_resource
 def init_schema() -> bool:
     """Create tables/indexes if absent. Idempotent; runs once per process."""
     eng = get_engine()
     metadata.create_all(eng)
     _ensure_columns(eng)
+    _enforce_rls(eng)
     return True
 
 
