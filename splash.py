@@ -121,7 +121,7 @@ def _mandala_svg():
         fill = TER if i % 2 == 0 else IND
         e.append(_path(f"M{tip} L{left} L{base} L{right} Z",
                        _sty(d=2.05 + i * 0.035, dd=0.7,
-                            fd=2.7 + i * 0.02, fo=0.30),
+                            fd=2.7 + i * 0.02, fo=1.0),
                        sw=2.0, fill=fill, cls="d f"))
 
     # madder dots in the gaps between ray tips
@@ -384,14 +384,20 @@ header,footer,#MainMenu,.stDeployButton,
   stroke-dasharray:1;stroke-dashoffset:1;
   animation:sp-draw var(--dd,1.1s) var(--sp-e) var(--d,0s) forwards;
 }
+/* Fills rest at their target opacity (var(--fo,1)); the reveal is carried by
+   the stage's own fade-in, not a per-shape fill animation. The old approach
+   animated fill-opacity toward a keyframe that referenced var(--fo,1); on
+   Streamlit ≥1.53's markdown pipeline that animation froze partway (~0.2),
+   and a frozen animation's value overrides the base — washing the mandala
+   out. A static fill can't freeze, so the colours are correct on every
+   Streamlit version. The stroke-draw choreography (explicit keyframe, no var)
+   is unaffected and stays. */
 .splash-stage .f{
-  fill-opacity:0;
-  animation:sp-fill .8s var(--sp-e) var(--fd,2.8s) forwards;
+  fill-opacity:var(--fo,1);
 }
 .splash-stage .d.f{
-  fill-opacity:0;stroke-dasharray:1;stroke-dashoffset:1;
-  animation:sp-draw var(--dd,1.1s) var(--sp-e) var(--d,0s) forwards,
-            sp-fill .8s var(--sp-e) var(--fd,2.8s) forwards;
+  fill-opacity:var(--fo,1);stroke-dasharray:1;stroke-dashoffset:1;
+  animation:sp-draw var(--dd,1.1s) var(--sp-e) var(--d,0s) forwards;
 }
 
 /* ── Double border frame (each edge = one stretched SVG line) */
@@ -511,6 +517,9 @@ div.stButton{position:fixed;left:0;right:0;bottom:9vh;
   display:flex;justify-content:center;z-index:130;pointer-events:none}
 div.stButton>button{pointer-events:auto}
 div.stButton>button{
+  /* Streamlit ≥1.5x makes buttons fill their container by default; the splash
+     wants a shrink-to-fit pill that the flex parent centres. */
+  width:auto;flex:0 0 auto;max-width:max-content;
   position:relative;overflow:hidden;cursor:pointer;
   font-family:'Instrument Serif','Noto Serif Devanagari',serif;
   font-size:1.14rem;letter-spacing:.05em;
@@ -539,7 +548,7 @@ body:has(div.stButton>button:active) .splash-stage{opacity:.35;transition:opacit
 
 /* ── Keyframes */
 @keyframes sp-draw{to{stroke-dashoffset:0}}
-@keyframes sp-fill{to{fill-opacity:var(--fo,1)}}
+@keyframes sp-fill{from{fill-opacity:0}}  /* 100% = element's own fill-opacity */
 @keyframes sp-fade-in{from{opacity:0}to{opacity:1}}
 @keyframes sp-appear{from{opacity:0}to{opacity:1}}
 @keyframes sp-fade-up{from{opacity:0;transform:translateY(18px)}
