@@ -1505,6 +1505,62 @@ with st.sidebar:
 
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
+    # Demo toggle button at the top of the sidebar
+    show_demo = st.session_state.get("include_demo", True)
+    if show_demo:
+        demo_btn_label = "🟢 प्रदर्शन डेटा: सक्रिय · Demo Data: Active"
+        # Style override for active button
+        st.markdown("""
+            <style>
+            section[data-testid="stSidebar"] .stButton > button {
+                background: linear-gradient(120deg, var(--violet), var(--violet-dim)) !important;
+                color: #F7EDD6 !important;
+                font-size: 12.5px !important;
+                font-weight: 700 !important;
+                border: 1px solid rgba(51,33,15,.3) !important;
+                border-radius: 8px !important;
+                padding: 10px 14px !important;
+                box-shadow: 0 10px 24px -8px rgba(147,49,43,.4) !important;
+                margin-bottom: 12px !important;
+                display: flex !important;
+                justify-content: center !important;
+                align-items: center !important;
+            }
+            </style>
+        """, unsafe_allow_html=True)
+    else:
+        demo_btn_label = "⚪ प्रदर्शन डेटा शामिल करें · Include Demo Data"
+        # Style override for inactive button
+        st.markdown("""
+            <style>
+            section[data-testid="stSidebar"] .stButton > button {
+                background: #EAD7AE !important;
+                color: rgba(51,33,15,.78) !important;
+                font-size: 12.5px !important;
+                font-weight: 600 !important;
+                border: 1px solid rgba(51,33,15,.25) !important;
+                border-radius: 8px !important;
+                padding: 10px 14px !important;
+                box-shadow: none !important;
+                margin-bottom: 12px !important;
+                display: flex !important;
+                justify-content: center !important;
+                align-items: center !important;
+            }
+            section[data-testid="stSidebar"] .stButton > button:hover {
+                background: #E3CDA0 !important;
+                color: #33210F !important;
+                border-color: rgba(51,33,15,.4) !important;
+            }
+            </style>
+        """, unsafe_allow_html=True)
+
+    if st.button(demo_btn_label, key="toggle_demo_top", use_container_width=True):
+        st.session_state["include_demo"] = not show_demo
+        st.rerun()
+
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
     selected = option_menu(
         menu_title=None,
         options=["Today's Brief","Complaints","Analytics Suite","Field Capture","Scheme Intelligence"],
@@ -1558,9 +1614,7 @@ with st.sidebar:
 
     # Demo rows are real table rows flagged is_demo; untick to read true
     # figures. Changing this re-queries on the next rerun.
-    st.checkbox("प्रदर्शन डेटा शामिल करें · Include demo data",
-                value=st.session_state.get("include_demo", True),
-                key="include_demo")
+    # Note: The checkbox is now replaced by the button at the top of the sidebar.
 
     st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
     _real_n = len(df[~df["is_demo"].astype(bool)]) if "is_demo" in df.columns else 0
