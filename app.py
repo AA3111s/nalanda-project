@@ -158,8 +158,21 @@ if not st.session_state.get("entered", False):
 # ══════════════════════════════════════════════════════════════════════
 # GEMINI
 # ══════════════════════════════════════════════════════════════════════
-_GEMINI_CHAIN = ["gemini-2.5-flash","gemini-2.0-flash","gemini-2.0-flash-lite","gemini-1.5-pro"]
-_RETRY_ERRORS = ("404","not found","deprecated","unavailable","429","quota","exceeded","resource_exhausted")
+_GEMINI_CHAIN = [
+    "gemini-2.0-flash",        # primary — stable, fast, free-tier
+    "gemini-2.0-flash-lite",   # lighter fallback
+    "gemini-1.5-flash",        # proven stable fallback
+    "gemini-2.5-flash",        # may be preview-gated; try last
+    "gemini-flash-latest",     # alias
+    "gemini-flash-lite-latest",# alias
+]
+# ── Clear any stale model name persisted in session state from a previous run.
+# gemini-1.5-pro and gemini-2.5-flash-* are discontinued / not on v1beta.
+_STALE_MODELS = {"gemini-1.5-pro", "gemini-pro", "gemini-pro-vision"}
+if st.session_state.get("_gemini_active") in _STALE_MODELS:
+    del st.session_state["_gemini_active"]
+
+_RETRY_ERRORS = ("404","not found","deprecated","unavailable","429","quota","exceeded","resource_exhausted","503","500","overloaded")
 _SKIP_ERRORS  = ("permission_denied","invalid_api_key","api_key_invalid","auth","invalid argument")
 
 def _is_retryable(err_str):
@@ -179,7 +192,7 @@ def init_gemini(api_key):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             client = _gai.Client(api_key=key)
-        active = _GEMINI_CHAIN[1]
+        active = _GEMINI_CHAIN[0]
         try:
             available = [m.name.split("/")[-1] for m in client.models.list()
                          if "generateContent" in (m.supported_actions or [])]
@@ -194,7 +207,7 @@ def init_gemini(api_key):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             _old.configure(api_key=key)
-        st.session_state["_gemini_active"] = _GEMINI_CHAIN[1]
+        st.session_state["_gemini_active"] = _GEMINI_CHAIN[0]
         return _old, "legacy"
     except Exception: return None, None
 
@@ -242,7 +255,7 @@ def _gemini_generate(client_tuple, prompt, image_jpeg=None):
     (text), and handles both the new google.genai and legacy
     google.generativeai SDKs."""
     client, sdk_type = (client_tuple if isinstance(client_tuple, tuple) else (client_tuple, "legacy"))
-    active_model = st.session_state.get("_gemini_active", _GEMINI_CHAIN[1])
+    active_model = st.session_state.get("_gemini_active", _GEMINI_CHAIN[0])
     models_to_try = [active_model] + [m for m in _GEMINI_CHAIN if m != active_model]
     _last_err = None; quota_hit = False
 
@@ -1462,7 +1475,7 @@ except db.ConfigError as _cfg:
 
 for _k in ("ocr_result","classify_result","_gemini_active"):
     if _k not in st.session_state:
-        st.session_state[_k] = None if _k != "_gemini_active" else _GEMINI_CHAIN[1]
+        st.session_state[_k] = None if _k != "_gemini_active" else _GEMINI_CHAIN[0]
 
 show_demo = st.session_state.get("include_demo", True)
 df        = db.load_grievances(include_demo=show_demo)
@@ -1593,7 +1606,7 @@ with st.sidebar:
     # the UI. Show only whether OCR is available — never the key itself.
     st.markdown("<div class='sb-cap'>OCR इंजन · OCR Engine</div>", unsafe_allow_html=True)
     if _resolved_gemini_key():
-        active_display = st.session_state.get("_gemini_active", _GEMINI_CHAIN[1])
+        active_display = st.session_state.get("_gemini_active", _GEMINI_CHAIN[0])
         st.markdown(f"<div class='sb-meta' style='color:#4F7C3A'>✓ OCR सक्रिय · {MODEL_LABEL}</div>", unsafe_allow_html=True)
     else:
         st.markdown("<div class='sb-meta' style='color:#93312B'>⚠ OCR निष्क्रिय — कुंजी सेट नहीं · key not configured</div>", unsafe_allow_html=True)
@@ -2185,7 +2198,7 @@ elif selected == "Field Capture":
 
     left, right = st.columns([1,1.5], gap="large")
     gemini_key_val = _resolved_gemini_key()
-    active_model   = st.session_state.get("_gemini_active", _GEMINI_CHAIN[1])
+    active_model   = st.session_state.get("_gemini_active", _GEMINI_CHAIN[0])
 
     with left:
         if input_mode == "📷  Scan Letter (Image)":
