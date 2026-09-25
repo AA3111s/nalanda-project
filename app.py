@@ -161,13 +161,21 @@ if not st.session_state.get("entered", False):
 # GEMINI
 # ══════════════════════════════════════════════════════════════════════
 _GEMINI_CHAIN = [
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash",
     "gemini-2.5-flash",
     "gemini-flash-latest",
     "gemini-flash-lite-latest",
-    "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite",
-    "gemini-3-flash-preview",
 ]
+
+# ── Invalidate any stale model name left in session state from a previous run.
+# The old gemini-1.5-pro / v1beta endpoint is discontinued; drop it so the
+# chain starts fresh from the first entry above.
+_STALE_MODELS = {"gemini-1.5-pro", "gemini-pro", "gemini-pro-vision",
+                 "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3-flash-preview"}
+if st.session_state.get("_gemini_active") in _STALE_MODELS:
+    del st.session_state["_gemini_active"]
 _RETRY_ERRORS = (
     "404", "not found", "deprecated", "unavailable", "503", "500", "502", "504",
     "429", "quota", "exceeded", "resource_exhausted", "deadline", "timeout",
