@@ -158,9 +158,22 @@ if not st.session_state.get("entered", False):
 # ══════════════════════════════════════════════════════════════════════
 # GEMINI
 # ══════════════════════════════════════════════════════════════════════
-_GEMINI_CHAIN = ["gemini-2.5-flash","gemini-2.0-flash","gemini-2.0-flash-lite","gemini-1.5-pro"]
-_RETRY_ERRORS = ("404","not found","deprecated","unavailable","429","quota","exceeded","resource_exhausted")
-_SKIP_ERRORS  = ("permission_denied","invalid_api_key","api_key_invalid","auth","invalid argument")
+# GEMINI
+# ══════════════════════════════════════════════════════════════════════
+_GEMINI_CHAIN = [
+    "gemini-2.5-flash",
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3-flash-preview",
+]
+_RETRY_ERRORS = (
+    "404", "not found", "deprecated", "unavailable", "503", "500", "502", "504",
+    "429", "quota", "exceeded", "resource_exhausted", "deadline", "timeout",
+    "overloaded", "high demand", "internal"
+)
+_SKIP_ERRORS  = ("permission_denied", "invalid_api_key", "api_key_invalid", "auth", "invalid argument")
 
 def _is_retryable(err_str):
     s = err_str.lower()
@@ -169,7 +182,27 @@ def _is_retryable(err_str):
 
 def _is_quota(err_str):
     s = err_str.lower()
-    return any(x in s for x in ("429","quota","exceeded","resource_exhausted"))
+    return any(x in s for x in ("429", "quota", "exceeded", "resource_exhausted"))
+
+def _clean_response_text(response) -> str:
+    """Extract clean string text from Gemini API response object, handling
+    potential thinking/thought parts or multipart responses."""
+    if response is None:
+        return ""
+    try:
+        t = response.text
+        if t:
+            return t.strip()
+    except Exception:
+        pass
+    try:
+        parts = response.candidates[0].content.parts
+        texts = [p.text for p in parts if getattr(p, "text", None)]
+        if texts:
+            return "\n".join(texts).strip()
+    except Exception:
+        pass
+    return str(response).strip()
 
 def init_gemini(api_key):
     if not api_key or api_key.strip() == "": return None, None
@@ -179,14 +212,10 @@ def init_gemini(api_key):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             client = _gai.Client(api_key=key)
-        active = _GEMINI_CHAIN[1]
-        try:
-            available = [m.name.split("/")[-1] for m in client.models.list()
-                         if "generateContent" in (m.supported_actions or [])]
-            for pref in _GEMINI_CHAIN:
-                if pref in available: active = pref; break
-        except Exception: pass
-        st.session_state["_gemini_active"] = active
+        active = st.session_state.get("_gemini_active")
+        if not active or active not in _GEMINI_CHAIN:
+            active = _GEMINI_CHAIN[0]
+            st.session_state["_gemini_active"] = active
         return client, "new"
     except ImportError: pass
     try:
@@ -194,7 +223,10 @@ def init_gemini(api_key):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             _old.configure(api_key=key)
-        st.session_state["_gemini_active"] = _GEMINI_CHAIN[1]
+        active = st.session_state.get("_gemini_active")
+        if not active or active not in _GEMINI_CHAIN:
+            active = _GEMINI_CHAIN[0]
+            st.session_state["_gemini_active"] = active
         return _old, "legacy"
     except Exception: return None, None
 
@@ -242,7 +274,9 @@ def _gemini_generate(client_tuple, prompt, image_jpeg=None):
     (text), and handles both the new google.genai and legacy
     google.generativeai SDKs."""
     client, sdk_type = (client_tuple if isinstance(client_tuple, tuple) else (client_tuple, "legacy"))
-    active_model = st.session_state.get("_gemini_active", _GEMINI_CHAIN[1])
+    active_model = st.session_state.get("_gemini_active", _GEMINI_CHAIN[0])
+    if active_model not in _GEMINI_CHAIN:
+        active_model = _GEMINI_CHAIN[0]
     models_to_try = [active_model] + [m for m in _GEMINI_CHAIN if m != active_model]
     _last_err = None; quota_hit = False
 
@@ -257,10 +291,13 @@ def _gemini_generate(client_tuple, prompt, image_jpeg=None):
         for model_name in models_to_try:
             try:
                 response = client.models.generate_content(model=model_name, contents=contents)
-                return response.text.strip(), None
+                txt = _clean_response_text(response)
+                if txt:
+                    st.session_state["_gemini_active"] = model_name
+                    return txt, None
             except Exception as _e:
                 _s = str(_e); _last_err = _s
-                if _is_quota(_s): quota_hit = True; time.sleep(5); continue
+                if _is_quota(_s): quota_hit = True; time.sleep(1.5); continue
                 if _is_retryable(_s): continue
                 return None, f"Fatal model error: {_s}"
         if quota_hit:
@@ -281,10 +318,13 @@ def _gemini_generate(client_tuple, prompt, image_jpeg=None):
                 m = _old_genai.GenerativeModel(model_name)
                 content = [prompt, img_obj] if img_obj is not None else prompt
                 response = m.generate_content(content)
-            return response.text.strip(), None
+            txt = _clean_response_text(response)
+            if txt:
+                st.session_state["_gemini_active"] = model_name
+                return txt, None
         except Exception as _e:
             _s = str(_e); _last_err = _s
-            if _is_quota(_s): quota_hit = True; time.sleep(5); continue
+            if _is_quota(_s): quota_hit = True; time.sleep(1.5); continue
             if _is_retryable(_s): continue
             return None, f"Fatal model error: {_s}"
     if quota_hit:
@@ -297,7 +337,10 @@ def run_gemini_ocr(client_tuple, image_bytes):
     {"transcription": ...} on success or {"error": ...}."""
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        buf = io.BytesIO(); img.save(buf, format="JPEG", quality=90)
+        max_dim = 2048
+        if max(img.size) > max_dim:
+            img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+        buf = io.BytesIO(); img.save(buf, format="JPEG", quality=85)
         jpeg_bytes = buf.getvalue()
     except Exception as e:
         return {"error": f"Image preprocessing failed: {e}"}
@@ -1462,7 +1505,9 @@ except db.ConfigError as _cfg:
 
 for _k in ("ocr_result","classify_result","_gemini_active"):
     if _k not in st.session_state:
-        st.session_state[_k] = None if _k != "_gemini_active" else _GEMINI_CHAIN[1]
+        st.session_state[_k] = None if _k != "_gemini_active" else _GEMINI_CHAIN[0]
+if st.session_state.get("_gemini_active") not in _GEMINI_CHAIN:
+    st.session_state["_gemini_active"] = _GEMINI_CHAIN[0]
 
 show_demo = st.session_state.get("include_demo", True)
 df        = db.load_grievances(include_demo=show_demo)
@@ -1593,7 +1638,7 @@ with st.sidebar:
     # the UI. Show only whether OCR is available — never the key itself.
     st.markdown("<div class='sb-cap'>OCR इंजन · OCR Engine</div>", unsafe_allow_html=True)
     if _resolved_gemini_key():
-        active_display = st.session_state.get("_gemini_active", _GEMINI_CHAIN[1])
+        active_display = st.session_state.get("_gemini_active", _GEMINI_CHAIN[0])
         st.markdown(f"<div class='sb-meta' style='color:#4F7C3A'>✓ OCR सक्रिय · {MODEL_LABEL}</div>", unsafe_allow_html=True)
     else:
         st.markdown("<div class='sb-meta' style='color:#93312B'>⚠ OCR निष्क्रिय — कुंजी सेट नहीं · key not configured</div>", unsafe_allow_html=True)
@@ -2185,7 +2230,7 @@ elif selected == "Field Capture":
 
     left, right = st.columns([1,1.5], gap="large")
     gemini_key_val = _resolved_gemini_key()
-    active_model   = st.session_state.get("_gemini_active", _GEMINI_CHAIN[1])
+    active_model   = st.session_state.get("_gemini_active", _GEMINI_CHAIN[0])
 
     with left:
         if input_mode == "📷  Scan Letter (Image)":
