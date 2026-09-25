@@ -277,6 +277,20 @@ def get_engine():
     # use server-side prepared statements by default. Pool stays small so
     # several app instances cannot exhaust the tenant's client slots.
     is_pgbouncer = ":6543" in url or "pooler.supabase.com" in url
+
+    # SQLAlchemy 2.x on Python 3.12 resolves the bare 'postgresql://' scheme
+    # to psycopg v3 when it happens to be installed, producing:
+    #   ModuleNotFoundError: No module named 'psycopg'
+    # We ship psycopg2-binary, not psycopg v3, so force the dialect explicitly.
+    # Rewrite any variant (postgresql, postgres, postgresql+psycopg,
+    # postgresql+psycopg3) → postgresql+psycopg2.
+    import re as _re
+    url = _re.sub(
+        r'^(postgres(?:ql)?)(\+psycopg(?:3)?)?://',
+        'postgresql+psycopg2://',
+        url,
+    )
+
     return create_engine(
         url,
         poolclass=QueuePool,
